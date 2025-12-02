@@ -1,0 +1,102 @@
+**Variación espacial del índice de fertilidad del suelo y recomendaciones de fertilización en los cultivos de Mango y Banano en agroecosistemas de la costa norte árida peruana**
+
+Sebastian Casas-Niño;
+
+---
+
+## Manuscript
+
+> https://docs.google.com/document/d/1xxui_VaceJ9X0oalHeBWUVFAcDywvMgN3iT3YPylqf8/edit?tab=t.0
+
+## Database
+
+> https://docs.google.com/spreadsheets/d/1lzq2s11NCiQRjGjA-21VjZGS6zXJsBE8dYtj1QnAFEo/edit?gid=843618649#gid=843618649
+
+## Presentation
+
+> Google Slides link
+
+---
+
+⇒ SciHub: research pipeline repository
+
+project-root/
+  ├── analysis.qmd          # Script with data analysis (R/Python)
+  ├── article.qmd           # Script for formatting the article
+  ├── design/               # Experimental design and setup
+  │   ├── design.qmd            # Document with experimental setup and planning
+  │   └── labels.pdf            # Labels for experimental units or field trials
+  ├── files/                # Supporting files for the project
+  │   ├── images/               # Raw and processed images
+  │   ├── zotero/               # Zotero library (.rds)
+  │   └── template.docx         # Journal article template  
+  ├── manuscript/           # Core outputs of the article
+  │   ├── Figures               # Figures for the manuscript (.jpg & .eps)
+  │   ├── ESM                   # Electronic Supplementary Material (ESM)
+  │   └── draft.docx            # Manuscript text versions
+  └── README.qmd            # Article title with authors:
+                                # Manuscript link (Google Docs)
+                                # Database link (Google Sheets)
+
+---
+
+⇒ Manuscript structure
+
+> Title Page / Cover page
+
+**TITLE**
+List of Authors
+Affiliations 
+Corresponding author
+Authors information
+
+| Author | ORCID | email |
+|--------|-------|-------|
+|        |       |       |
+|        |       |       |
+|        |       |       |
+
+STATEMENTS AND DECLARATIONS
+
+Acknowledgments
+Funding
+Conflict of interest
+Data availability
+Author contributions
+- CRediT
+
+> Article
+
+**TITLE**
+
+ABSTRACT
+
+Keywords: (alphabetical order)
+
+INTRODUCTION
+
+- Topic paragraphs (funnel approach)
+- State of the art
+- Objectives or hypothesis
+- Research/knowledge gaps
+
+MATERIALS AND METHODS
+
+RESULTS
+
+- Title by research stages or objectives
+  - Motivation sentence (method justification: what/why/how)
+  - Result description
+
+DISCUSSION
+
+- Research summary
+- Title based on the objectives (*)
+- Description of the main results with cross references
+- Comparison with other research
+- Limitations and relevance
+- Perspectives and future steps (*)
+
+CONCLUSION
+
+REFERENCES
