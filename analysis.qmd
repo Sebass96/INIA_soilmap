@@ -52,9 +52,9 @@ glimpse(fb)
 
 ```{r}
 rasters_folder <- "gis/Covariables_alineados/"
-points_geojson <- "gis/JSON/soil_samples.json"
-response_field <- "pH"
-out_folder <- "ph_RK/"
+points_geojson <- "gis/JSON/soil_samples.geojson"
+response_field <- "SQIw"
+out_folder <- "SQIw_RK/"
 dir.create(out_folder, showWarnings = FALSE, recursive = TRUE)
 
 predictor_names <- c(
