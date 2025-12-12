@@ -103,7 +103,7 @@ if (!(response_field %in% names(pts_sf))) stop(paste0("El campo '", response_fie
 rast_crs <- terra::crs(rast_stack, proj = TRUE)
 if (is.na(rast_crs) || nchar(rast_crs) == 0) {
   warning("El raster no tiene CRS definido. Se asignará EPSG:32717 (UTM 17S).")
-  terra::crs(rast_stack) <- "EPSG:32718"
+  terra::crs(rast_stack) <- "EPSG:32717"
   rast_crs <- terra::crs(rast_stack, proj = TRUE)
 }
 if (is.na(sf::st_crs(pts_sf))) {
