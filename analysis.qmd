@@ -46,204 +46,403 @@ fb <- gs %>%
   range_read(ss = ., sheet = "Data_corregida")
 
 glimpse(fb)
+
+cols <- c("Elevation", "Slope", "Orientition", "Hillshade",
+  "TPI", "TRI", "TWI", "NDVI", "SAVI", "NDWI",
+  "Precipitation", "Temperature")
+
+colSums(fb[cols] == 0)
 ```
 
 ## 1. Parámetros fijos
 
 ```{r}
-rasters_folder <- "gis/Covariables_alineados/"
-points_geojson <- "gis/JSON/soil_samples.geojson"
-response_field <- "SQIw"
-out_folder <- "SQIw_RK/"
-dir.create(out_folder, showWarnings = FALSE, recursive = TRUE)
+rasters_folder  <- "gis/Covariables_alineados/"
+points_geojson  <- "gis/JSON/soil_samples.geojson"
+response_field  <- "SQIw"
+out_folder      <- "SQIw_RK/"
+
+dir.create(
+  out_folder,
+  showWarnings = FALSE,
+  recursive    = TRUE
+)
 
 predictor_names <- c(
-  "Elevation", "Slope", "Orientition", "Hillshade",
+  "Elevation", "Slope", "Orientation", "Hillshade",
   "TPI", "TRI", "TWI", "NDVI", "SAVI", "NDWI",
   "Precipitation", "Temperature"
 )
 
-## RFE / CV / RF params
 set.seed(123)
-k_folds <- 5
-rfe_sizes <- c(4, 6, 8, 10) # tamaños candidatos
-train_frac <- 0.80 # 80% entrenamiento / 20% prueba
 
-# Modelos candidatos para variograma (autoselección)
-model_candidates <- c("Sph", "Exp", "Gau", "Mat")
+k_folds    <- 5
+rfe_sizes  <- c(4, 6, 8, 10)
+train_frac <- 0.80
+
+model_candidates <- c(
+  "Sph", "Exp", "Gau", "Mat"
+)
 ```
 
 # 2. Cargar rasters y verificar nombres 
 
 ```{r}
-tif_files <- list.files(rasters_folder, pattern = "\\.tif$", full.names = TRUE)
-if (length(tif_files) == 0) stop("No encontré archivos .tif en la carpeta indicada.")
+tif_files <- list.files(
+  rasters_folder,
+  pattern     = "\\.tif$",
+  full.names = TRUE
+)
 
-expected_files <- file.path(rasters_folder, paste0(predictor_names, ".tif"))
+if (length(tif_files) == 0) {
+  stop("No encontré archivos .tif en la carpeta indicada.")
+}
+
+expected_files <- file.path(
+  rasters_folder,
+  paste0(predictor_names, ".tif")
+)
+
 missing_files <- expected_files[!file.exists(expected_files)]
+
 if (length(missing_files) > 0) {
   stop(
-    "Faltan archivos TIFF esperados. Archivos que no encontré:\n",
+    "Faltan archivos TIFF:\n",
     paste(basename(missing_files), collapse = ", ")
   )
 }
 
+# Cargar stack (asumimos ya alineados a 100 m)
 rast_stack <- terra::rast(expected_files)
 names(rast_stack) <- predictor_names
 print(rast_stack)
+
+# ======================================================================
+# [A] MÁSCARA COMÚN DE COVARIABLES
+# ======================================================================
+cat("Creando máscara común de covariables...\n")
+
+mask_all <- terra::app(
+  rast_stack,
+  function(x) all(!is.na(x))
+)
+
+cat(
+  "Celdas válidas (todas las covariables):",
+  terra::global(mask_all, sum, na.rm = TRUE)[1, 1],
+  "\n"
+)
+
+# Aplicar la misma máscara a TODAS las covariables
+rast_stack <- terra::mask(
+  rast_stack,
+  mask_all,
+  maskvalue = 0
+)
 ```
 
-# 3. Cargar puntos (.geojson)
+# 3. Cargar puntos (.geojson) — añadir site_id para mantener emparejado
 
 ```{r}
-pts_sf <- sf::st_read(points_geojson, quiet = TRUE)
-if (!(response_field %in% names(pts_sf))) stop(paste0("El campo '", response_field, "' no existe en el GeoJSON."))
+pts_sf <- sf::st_read(
+  points_geojson,
+  quiet = TRUE
+)
+
+if (!(response_field %in% names(pts_sf))) {
+  stop(
+    paste0(
+      "El campo '",
+      response_field,
+      "' no existe en el GeoJSON."
+    )
+  )
+}
+
+# Añadir site_id para tracking
+pts_sf$site_id_internal_rk <- seq_len(nrow(pts_sf))
 
 # Asegurar CRS: usar CRS del raster
 rast_crs <- terra::crs(rast_stack, proj = TRUE)
+
 if (is.na(rast_crs) || nchar(rast_crs) == 0) {
-  warning("El raster no tiene CRS definido. Se asignará EPSG:32717 (UTM 17S).")
+  warning(
+    "El raster no tiene CRS definido. Se asignará EPSG:32717 (UTM 17S)."
+  )
   terra::crs(rast_stack) <- "EPSG:32717"
   rast_crs <- terra::crs(rast_stack, proj = TRUE)
 }
+
 if (is.na(sf::st_crs(pts_sf))) {
   warning("Los puntos no tienen CRS. Se asignará EPSG:32717.")
   st_crs(pts_sf) <- 32717
 }
+
 if (sf::st_crs(pts_sf)$wkt != rast_crs) {
-  pts_sf <- sf::st_transform(pts_sf, crs = rast_crs)
+  pts_sf <- sf::st_transform(
+    pts_sf,
+    crs = rast_crs
+  )
 }
 ```
 
-# 4. Extraer valores raster en los puntos 
+# 4. Extraer valores raster en los puntos (mantener site_id)
 
 ```{r}
-vals <- terra::extract(rast_stack, vect(pts_sf))
-pts_df <- cbind(st_drop_geometry(pts_sf), vals[, -1, drop = FALSE])
+vals <- terra::extract(
+  rast_stack,
+  vect(pts_sf)
+)
+
+pts_df <- cbind(
+  st_drop_geometry(pts_sf),
+  vals[, -1, drop = FALSE]
+)
 
 # Quitar filas con NA en respuesta o en predictoras
-pts_df <- pts_df[!is.na(pts_df[[response_field]]), , drop = FALSE]
-complete_cases <- complete.cases(pts_df[, predictor_names])
-pts_df <- pts_df[complete_cases, ]
+pts_df <- pts_df[
+  !is.na(pts_df[[response_field]]),
+  ,
+  drop = FALSE
+]
 
-if (nrow(pts_df) < 10) warning("Pocos puntos después de limpieza — procede con precaución.")
+complete_cases <- complete.cases(
+  pts_df[, predictor_names]
+)
+
+pts_df <- pts_df[
+  complete_cases,
+]
+
+if (nrow(pts_df) < 10) {
+  warning(
+    "Pocos puntos después de limpieza — procede con precaución."
+  )
+}
 ```
 
 # 5. División Train/Test 80/20 (para evaluación)
 ```{r}
 set.seed(123)
-train_index <- caret::createDataPartition(pts_df[[response_field]], p = train_frac, list = FALSE)
-df_train <- pts_df[train_index, , drop = FALSE]
-df_test <- pts_df[-train_index, , drop = FALSE]
+
+train_index <- caret::createDataPartition(
+  pts_df[[response_field]],
+  p    = train_frac,
+  list = FALSE
+)
+
+df_train <- pts_df[
+  train_index,
+  ,
+  drop = FALSE
+]
+
+df_test <- pts_df[
+  -train_index,
+  ,
+  drop = FALSE
+]
 
 cat(
-  "Número de puntos - total:", nrow(pts_df),
-  " train:", nrow(df_train), " test:", nrow(df_test), "\n"
+  "Número de puntos - total:",
+  nrow(pts_df),
+  " train:",
+  nrow(df_train),
+  " test:",
+  nrow(df_test),
+  "\n"
 )
 ```
 
 # 6. RFE sobre el conjunto de entrenamiento
 
 ```{r}
-x_train <- df_train[, predictor_names, drop = FALSE]
+x_train <- df_train[
+  ,
+  predictor_names,
+  drop = FALSE
+]
+
 y_train <- df_train[[response_field]]
 
 rfe_ctrl <- caret::rfeControl(
   functions = caret::rfFuncs,
-  method = "repeatedcv",
-  number = k_folds,
-  repeats = 1,
-  verbose = FALSE
+  method    = "repeatedcv",
+  number    = k_folds,
+  repeats  = 1,
+  verbose  = FALSE
 )
 
 set.seed(123)
+
 rfe_res <- caret::rfe(
-  x = x_train, y = y_train,
-  sizes = rfe_sizes,
+  x          = x_train,
+  y          = y_train,
+  sizes      = rfe_sizes,
   rfeControl = rfe_ctrl
 )
 
 cat("RFE completado. Variables seleccionadas:\n")
 print(rfe_res$optVariables)
+
 selected_vars <- rfe_res$optVariables
 ```
 
 # 7. Entrenar RF en el conjunto de entrenamiento (con CV interno)
 
 ```{r}
-train_ctrl <- caret::trainControl(method = "cv", number = k_folds, savePredictions = "final")
+train_ctrl <- caret::trainControl(
+  method          = "cv",
+  number          = k_folds,
+  savePredictions = "final"
+)
+
 set.seed(123)
+
 rf_fit_train <- caret::train(
-  x = x_train[, selected_vars, drop = FALSE],
-  y = y_train,
-  method = "rf",
+  x          = x_train[, selected_vars, drop = FALSE],
+  y          = y_train,
+  method     = "rf",
   trControl = train_ctrl,
   importance = TRUE
 )
+
 print(rf_fit_train)
 ```
 
 # 8. Evaluación en conjunto de prueba (20%)
 
 ```{r}
-x_test <- df_test[, selected_vars, drop = FALSE]
+x_test <- df_test[
+  ,
+  selected_vars,
+  drop = FALSE
+]
+
 y_test <- df_test[[response_field]]
-pred_test <- predict(rf_fit_train, newdata = x_test)
 
-# Métricas test
-rmse_test <- Metrics::rmse(y_test, pred_test)
-mae_test <- Metrics::mae(y_test, pred_test)
-bias_test <- mean(pred_test - y_test, na.rm = TRUE)
-r2_test <- cor(y_test, pred_test, use = "complete.obs")^2
+pred_test <- predict(
+  rf_fit_train,
+  newdata = x_test
+)
 
-metrics_test <- data.frame(RMSE = rmse_test, MAE = mae_test, BIAS = bias_test, R2 = r2_test, n_test = length(y_test))
-readr::write_csv(metrics_test, file.path(out_folder, "test_metrics.csv"))
-cat("Métricas test guardadas en:", file.path(out_folder, "test_metrics.csv"), "\n")
+rmse_test <- Metrics::rmse(
+  y_test,
+  pred_test
+)
 
-# Guardar tabla test predicted vs observed
-test_table <- data.frame(observed = y_test, predicted = pred_test)
-readr::write_csv(test_table, file.path(out_folder, "test_predicted_vs_observed.csv"))
+mae_test <- Metrics::mae(
+  y_test,
+  pred_test
+)
+
+bias_test <- mean(
+  pred_test - y_test,
+  na.rm = TRUE
+)
+
+r2_test <- cor(
+  y_test,
+  pred_test,
+  use = "complete.obs"
+)^2
+
+metrics_test <- data.frame(
+  RMSE   = rmse_test,
+  MAE    = mae_test,
+  BIAS   = bias_test,
+  R2     = r2_test,
+  n_test = length(y_test)
+)
+
+readr::write_csv(
+  metrics_test,
+  file.path(out_folder, "test_metrics.csv")
+)
+
+cat(
+  "Métricas test guardadas en:",
+  file.path(out_folder, "test_metrics.csv"),
+  "\n"
+)
+
+test_table <- data.frame(
+  observed  = y_test,
+  predicted = pred_test
+)
+
+readr::write_csv(
+  test_table,
+  file.path(out_folder, "test_predicted_vs_observed.csv")
+)
 ```
 
 # # 9. Guardar predicciones CV (del entrenamiento)
 
 ```{r}
 cv_df <- rf_fit_train$pred
-cv_outfile <- file.path(out_folder, "cv_predictions_train.csv")
-readr::write_csv(cv_df, cv_outfile)
-cat("Predicciones CV (train) guardadas en:", cv_outfile, "\n")
+
+readr::write_csv(
+  cv_df,
+  file.path(out_folder, "cv_predictions_train.csv")
+)
+
+cat(
+  "Predicciones CV (train) guardadas en:",
+  file.path(out_folder, "cv_predictions_train.csv"),
+  "\n"
+)
 ```
 
 # 10. Reentrenar RF sobre TODO el conjunto (train + test) para mapas
 
 ```{r}
-x_full <- pts_df[, selected_vars, drop = FALSE]
+x_full <- pts_df[
+  ,
+  selected_vars,
+  drop = FALSE
+]
+
 y_full <- pts_df[[response_field]]
 
 set.seed(123)
-rf_fit_full <- randomForest::randomForest(x = x_full, y = y_full, importance = TRUE)
+
+rf_fit_full <- randomForest::randomForest(
+  x          = x_full,
+  y          = y_full,
+  importance = TRUE
+)
 ```
 
 # 11. Predicción de la tendencia (RF final) sobre todo el raster
 
 ```{r}
-cat("\n--- PREDICCIÓN RANDOM FOREST SOBRE EL RASTER COMPLETO (manejo conservador NA) ---\n")
+cat(
+  "\n--- PREDICCIÓN RANDOM FOREST SOBRE EL RASTER COMPLETO (manejo conservador NA) ---\n"
+)
+
 cat("Variables seleccionadas por RFE:\n")
 print(selected_vars)
+
 cat("Variables presentes en el stack raster:\n")
 print(names(rast_stack))
 
-missing_layers <- setdiff(selected_vars, names(rast_stack))
+missing_layers <- setdiff(
+  selected_vars,
+  names(rast_stack)
+)
+
 if (length(missing_layers) > 0) {
-  stop(paste(
-    "Las siguientes capas NO existen en el raster stack y el RF las requiere:",
-    paste(missing_layers, collapse = ", ")
-  ))
+  stop(
+    paste(
+      "Las siguientes capas NO existen:",
+      paste(missing_layers, collapse = ", ")
+    )
+  )
 }
 
 trend_stack <- rast_stack[[selected_vars]]
 
-# Predict con manejo de filas all-NA
 trend_raster <- try(
   terra::predict(
     trend_stack,
@@ -251,361 +450,794 @@ trend_raster <- try(
     na.rm = TRUE,
     fun = function(model, data) {
       df <- as.data.frame(data)
-      mask_all_na <- apply(df, 1, function(r) all(is.na(r)))
-      out <- rep(NA_real_, nrow(df))
+
+      mask_all_na <- apply(
+        df,
+        1,
+        function(r) all(is.na(r))
+      )
+
+      out <- rep(
+        NA_real_,
+        nrow(df)
+      )
+
       if (any(!mask_all_na)) {
-        df_valid <- df[!mask_all_na, , drop = FALSE]
-        preds_valid <- predict(model, df_valid)
+        df_valid <- df[
+          !mask_all_na,
+          ,
+          drop = FALSE
+        ]
+
+        preds_valid <- predict(
+          model,
+          df_valid
+        )
+
         out[!mask_all_na] <- preds_valid
       }
+
       return(out)
     }
   )
 )
+
 if (inherits(trend_raster, "try-error")) {
-  warning("terra::predict con randomForest falló — usando raster::predict como alternativa.")
+  warning(
+    "terra::predict con randomForest falló — usando raster::predict como alternativa."
+  )
+
   r_stack_r <- raster::stack()
+
   for (v in selected_vars) {
-    r_stack_r <- raster::addLayer(r_stack_r, raster::raster(rast_stack[[v]]))
+    r_stack_r <- raster::addLayer(
+      r_stack_r,
+      raster::raster(rast_stack[[v]])
+    )
   }
+
   names(r_stack_r) <- selected_vars
-  trend_raster_r <- raster::predict(r_stack_r, rf_fit_full, na.rm = TRUE)
-  trend_raster <- terra::rast(trend_raster_r)
+
+  trend_raster_r <- raster::predict(
+    r_stack_r,
+    rf_fit_full,
+    na.rm = TRUE
+  )
+
+  trend_raster <- terra::rast(
+    trend_raster_r
+  )
 }
 
-trend_outfile <- file.path(out_folder, "trend_RF.tif")
-terra::writeRaster(trend_raster, trend_outfile, overwrite = TRUE)
-cat("✅ Raster de tendencia (Random Forest final) guardado en:\n", trend_outfile, "\n")
+trend_outfile <- file.path(
+  out_folder,
+  "trend_RF.tif"
+)
+
+terra::writeRaster(
+  trend_raster,
+  trend_outfile,
+  overwrite = TRUE
+)
+
+cat(
+  "✅ Raster de tendencia (Random Forest final) guardado en:\n",
+  trend_outfile,
+  "\n"
+)
 ```
 
 # 12. Calcular residuos en los puntos usando el modelo full
 
 ```{r}
-pred_full_on_points <- predict(rf_fit_full, newdata = x_full)
+pred_full_on_points <- predict(
+  rf_fit_full,
+  newdata = x_full
+)
+
 residuals_full <- y_full - pred_full_on_points
 
-# Preparar objeto espacial para gstat (usar sp)
-coords_all <- sf::st_coordinates(pts_sf)[complete_cases, , drop = FALSE]
-proj4_str <- try(terra::crs(rast_stack), silent = TRUE)
-if (is.na(proj4_str) || length(proj4_str) == 0) proj4_str <- NA_character_
-pts_sp <- sp::SpatialPointsDataFrame(
-  coords = coords_all, data = data.frame(resid = residuals_full),
-  proj4string = sp::CRS(proj4_str)
+# Reconstruir pts_used_sf alineado con pts_df mediante site_id_internal_rk
+# pts_df contiene la columna site_id_internal_rk porque venía de pts_sf
+if (!"site_id_internal_rk" %in% names(pts_df)) {
+  stop(
+    "site_id_internal_rk no encontrado en pts_df — revisa extracción inicial."
+  )
+}
+
+site_ids_used <- pts_df$site_id_internal_rk
+
+pts_used_sf <- pts_sf[
+  pts_sf$site_id_internal_rk %in% site_ids_used,
+  ,
+  drop = FALSE
+]
+
+# Asegurar orden idéntico: ordenar pts_used_sf para coincidir con pts_df
+ord <- match(
+  pts_df$site_id_internal_rk,
+  pts_used_sf$site_id_internal_rk
+)
+
+pts_used_sf <- pts_used_sf[
+  ord,
+  ,
+  drop = FALSE
+]
+
+# Añadir residuales al sf (alineado)
+if (nrow(pts_used_sf) != length(residuals_full)) {
+  stop("No coinciden nº de puntos y residuales.")
+}
+
+pts_used_sf$resid <- residuals_full
+
+# Convertir a SpatialPointsDataFrame para gstat
+pts_sp <- as(
+  pts_used_sf,
+  "Spatial"
+)
+
+proj4string(pts_sp) <- sp::CRS(
+  terra::crs(rast_stack, proj = TRUE)
+)
+
+cat(
+  "✔ pts_sp preparado con",
+  length(pts_sp),
+  "puntos para kriging.\n"
 )
 ```
 
 # 13. Variograma experimental y AUTO-SELECCIÓN DEL MEJOR MODELO
 
 ```{r}
-vgm_emp <- gstat::variogram(resid ~ 1, data = pts_sp)
+vgm_emp <- gstat::variogram(
+  resid ~ 1,
+  data = pts_sp
+)
 
-# Estimaciones iniciales
-initial_sill <- var(residuals_full, na.rm = TRUE)
-initial_range <- max(sp::spDists(as.matrix(coords_all), longlat = FALSE)) / 3
+initial_sill   <- var(residuals_full, na.rm = TRUE)
+initial_range  <- max(
+  sp::spDists(
+    as.matrix(sf::st_coordinates(pts_used_sf)),
+    longlat = FALSE
+  )
+) / 3
 initial_nugget <- initial_sill * 0.05
 
 vgm_results <- list()
-sse_values <- setNames(rep(NA_real_, length(model_candidates)), model_candidates)
+sse_values  <- setNames(
+  rep(NA_real_, length(model_candidates)),
+  model_candidates
+)
 
-# Probar cada candidato
 for (m in model_candidates) {
-  vgm_init <- gstat::vgm(psill = initial_sill, model = m, range = initial_range, nugget = initial_nugget)
+
+  vgm_init <- gstat::vgm(
+    psill  = initial_sill,
+    model  = m,
+    range  = initial_range,
+    nugget = initial_nugget
+  )
+
   vgm_fit_try <- try(
     gstat::fit.variogram(
       vgm_emp,
       vgm_init,
-      fit.method = 6, # método robusto
-      maxit = 400
+      fit.method = 6,
+      maxit      = 400
     ),
     silent = TRUE
   )
 
   if (!inherits(vgm_fit_try, "try-error")) {
-    sse <- try(attr(vgm_fit_try, "SSErr"), silent = TRUE)
-    if (inherits(sse, "try-error") || is.null(sse)) sse <- NA_real_
+
+    sse <- try(
+      attr(vgm_fit_try, "SSErr"),
+      silent = TRUE
+    )
+
+    if (inherits(sse, "try-error") || is.null(sse)) {
+      sse <- NA_real_
+    }
+
     vgm_results[[m]] <- vgm_fit_try
-    sse_values[m] <- sse
+    sse_values[m]    <- sse
+
   } else {
     sse_values[m] <- NA_real_
   }
 }
 
-# Seleccionar el mejor (mínimo SSE válido)
 valid_sse <- sse_values[!is.na(sse_values)]
+
 if (length(valid_sse) == 0) {
-  warning("❌ Ningún modelo de variograma logró ajuste — se usará el modelo esférico por defecto.")
+
+  warning(
+    "Ningún modelo de variograma logró ajuste — usando Sph por defecto."
+  )
+
   best_model_name <- "Sph"
-  vgm_fit <- gstat::vgm(psill = initial_sill, model = best_model_name, range = initial_range, nugget = initial_nugget)
+
+  vgm_fit <- gstat::vgm(
+    psill  = initial_sill,
+    model  = best_model_name,
+    range  = initial_range,
+    nugget = initial_nugget
+  )
+
 } else {
+
   best_model_name <- names(valid_sse)[which.min(valid_sse)]
-  vgm_fit <- vgm_results[[best_model_name]]
-  message(paste0(
-    "✅ Mejor modelo de variograma seleccionado: ", best_model_name,
-    " (SSE = ", round(min(valid_sse), 6), ")"
-  ))
+  vgm_fit         <- vgm_results[[best_model_name]]
+
+  message(
+    paste0(
+      "Mejor modelo de variograma: ",
+      best_model_name,
+      " (SSE=",
+      round(min(valid_sse), 6),
+      ")"
+    )
+  )
 }
 
 print(vgm_emp)
 print(vgm_fit)
 
-# Guardar variograma empírico
-vgm_emp_df <- as.data.frame(vgm_emp)
-readr::write_csv(vgm_emp_df, file.path(out_folder, "variograma_empirico.csv"))
-cat("Variograma empírico guardado en:", file.path(out_folder, "variograma_empirico.csv"), "\n")
+readr::write_csv(
+  as.data.frame(vgm_emp),
+  file.path(out_folder, "variograma_empirico.csv")
+)
 
-# --------- Extracción de parámetros del modelo seleccionado ---------------
-vgm_fit_df <- try(as.data.frame(vgm_fit), silent = TRUE)
+vgm_fit_df <- try(
+  as.data.frame(vgm_fit),
+  silent = TRUE
+)
 
 nugget_val <- NA_real_
-psill_val <- NA_real_
-range_val <- NA_real_
+psill_val  <- NA_real_
+range_val  <- NA_real_
 model_name <- best_model_name
 
 if (!inherits(vgm_fit_df, "try-error") && nrow(vgm_fit_df) > 0) {
+
   if (any(grepl("Nug", vgm_fit_df$model, ignore.case = TRUE))) {
-    nugget_val <- vgm_fit_df$psill[grepl("Nug", vgm_fit_df$model, ignore.case = TRUE)][1]
-  } else if (any(vgm_fit_df$range == 0, na.rm = TRUE)) {
-    nugget_val <- vgm_fit_df$psill[which(vgm_fit_df$range == 0)[1]]
-  } else {
-    nugget_val <- 0
+    nugget_val <- vgm_fit_df$psill[
+      grepl("Nug", vgm_fit_df$model, ignore.case = TRUE)
+    ][1]
   }
 
-  non_nug_rows <- which(!grepl("Nug", vgm_fit_df$model, ignore.case = TRUE))
+  non_nug_rows <- which(
+    !grepl("Nug", vgm_fit_df$model, ignore.case = TRUE)
+  )
+
   if (length(non_nug_rows) > 0) {
-    idx <- non_nug_rows[1]
+
+    idx        <- non_nug_rows[1]
     psill_val <- vgm_fit_df$psill[idx]
     range_val <- vgm_fit_df$range[idx]
     model_name <- as.character(vgm_fit_df$model[idx])
+
   } else {
-    psill_val <- vgm_fit_df$psill[1]
-    range_val <- vgm_fit_df$range[1]
+
+    psill_val  <- vgm_fit_df$psill[1]
+    range_val  <- vgm_fit_df$range[1]
     model_name <- as.character(vgm_fit_df$model[1])
   }
 }
 
-sill_val <- sum(c(nugget_val, psill_val), na.rm = TRUE)
-PSV <- if (!is.na(psill_val) && !is.na(sill_val) && sill_val > 0) (psill_val / sill_val) * 100 else NA_real_
+sill_val <- sum(
+  c(nugget_val, psill_val),
+  na.rm = TRUE
+)
+
+PSV <- if (
+  !is.na(psill_val) &&
+  !is.na(sill_val) &&
+  sill_val > 0
+) {
+  (psill_val / sill_val) * 100
+} else {
+  NA_real_
+}
 
 vgm_params_table <- data.frame(
-  model = model_name,
-  nugget = nugget_val,
-  psill = psill_val,
-  sill = sill_val,
-  range = range_val,
+  model   = model_name,
+  nugget  = nugget_val,
+  psill   = psill_val,
+  sill    = sill_val,
+  range   = range_val,
   PSV_pct = PSV,
   stringsAsFactors = FALSE
 )
 
-readr::write_csv(vgm_params_table, file.path(out_folder, "variograma_parametros.csv"))
-cat("📌 Parámetros del variograma guardados en:", file.path(out_folder, "variograma_parametros.csv"), "\n")
-
-# Gráfico PNG variograma empírico + ajuste
-vg_png <- file.path(out_folder, "variograma_empirico_ajustado.png")
-png(filename = vg_png, width = 900, height = 700)
-try(
-  {
-    plot(vgm_emp, vgm_fit,
-      main = paste("Variograma empírico y ajuste (", model_name, ")"),
-      xlab = "Distancia", ylab = "Semivarianza"
-    )
-  },
-  silent = TRUE
+readr::write_csv(
+  vgm_params_table,
+  file.path(out_folder, "variograma_parametros.csv")
 )
-dev.off()
-cat("📍 Gráfico del variograma guardado en:", vg_png, "\n")
+
+cat(
+  "Parámetros del variograma guardados en:",
+  file.path(out_folder, "variograma_parametros.csv"),
+  "\n"
+)
 
 # 13.3 Validación cruzada LOO de Kriging sobre los puntos (krige.cv)
-cv_krig <- try(gstat::krige.cv(formula = resid ~ 1, locations = pts_sp, model = vgm_fit, nmax = 30), silent = TRUE)
+cv_krig <- try(
+  gstat::krige.cv(
+    formula   = resid ~ 1,
+    locations = pts_sp,
+    model     = vgm_fit,
+    nmax      = 30
+  ),
+  silent = TRUE
+)
+
 if (inherits(cv_krig, "try-error")) {
-  warning("krige.cv falló. No se pudieron calcular métricas LOO de kriging.")
+  warning("krige.cv falló.")
   cv_krig <- NULL
 }
 
-# 13.4 Calcular métricas (MAE, RMSE, R2, PBIAS) entre resid_obs y resid_cv_pred
-krig_cv_metrics <- data.frame(MAE = NA_real_, RMSE = NA_real_, BIAS = NA_real_, R2 = NA_real_, PBIAS_pct = NA_real_, n = NA_integer_)
-
 if (!is.null(cv_krig)) {
-  pred_col_name <- names(cv_krig)[grepl("pred", names(cv_krig), ignore.case = TRUE)][1]
-  if (is.null(pred_col_name) || length(pred_col_name) == 0 || is.na(pred_col_name)) {
-    if ("var1.pred" %in% names(cv_krig)) {
-      pred_col_name <- "var1.pred"
-    } else if ("resid.pred" %in% names(cv_krig)) pred_col_name <- "resid.pred"
-  }
-  pred_vals <- cv_krig[[pred_col_name]]
-  obs_vals <- residuals_full
-  n_obs <- min(length(obs_vals), length(pred_vals))
-  obs_vals <- obs_vals[1:n_obs]
-  pred_vals <- pred_vals[1:n_obs]
 
-  mae_krig <- Metrics::mae(obs_vals, pred_vals)
-  rmse_krig <- Metrics::rmse(obs_vals, pred_vals)
-  bias_krig <- mean(pred_vals - obs_vals, na.rm = TRUE)
-  r2_krig <- try(cor(obs_vals, pred_vals, use = "complete.obs")^2, silent = TRUE)
-  if (inherits(r2_krig, "try-error")) r2_krig <- NA_real_
-  pbias_krig <- 100 * sum(pred_vals - obs_vals, na.rm = TRUE) / sum(obs_vals, na.rm = TRUE)
-
-  krig_cv_metrics <- data.frame(
-    MAE = mae_krig,
-    RMSE = rmse_krig,
-    BIAS = bias_krig,
-    R2 = r2_krig,
-    PBIAS_pct = pbias_krig,
-    n = n_obs
+  rf_pred_points <- predict(
+    rf_fit_full,
+    newdata = x_full
   )
 
-  # Exportar resultados krige.cv (detallado) y métricas
-  cv_krig_df <- as.data.frame(cv_krig)
-  readr::write_csv(cv_krig_df, file.path(out_folder, "krige_cv_detailed.csv"))
-  readr::write_csv(krig_cv_metrics, file.path(out_folder, "krige_cv_metrics_summary.csv"))
-  cat("Resultados krige.cv y métricas guardadas en:", out_folder, "\n")
-} else {
-  cat("No se generaron métricas de kriging (cv_krig es NULL).\n")
+  resid_krig_loo <- cv_krig$var1.pred
+  rk_pred_points <- rf_pred_points + resid_krig_loo
+  obs_vals       <- y_full
+
+  # ---- FILTRAR CASOS VÁLIDOS (CLAVE) ----
+  valid_idx <- which(
+    !is.na(rk_pred_points) &
+    !is.na(obs_vals)
+  )
+
+  rk_cv_metrics_full <- data.frame(
+    Method     = "RK_full_CV",
+    RMSE       = Metrics::rmse(
+      obs_vals[valid_idx],
+      rk_pred_points[valid_idx]
+    ),
+    MAE        = Metrics::mae(
+      obs_vals[valid_idx],
+      rk_pred_points[valid_idx]
+    ),
+    BIAS       = mean(
+      rk_pred_points[valid_idx] - obs_vals[valid_idx]
+    ),
+    R2         = cor(
+      obs_vals[valid_idx],
+      rk_pred_points[valid_idx]
+    )^2,
+    PBIAS_pct  = 100 *
+      sum(
+        rk_pred_points[valid_idx] - obs_vals[valid_idx]
+      ) /
+      sum(obs_vals[valid_idx]),
+    n          = length(valid_idx)
+  )
+
+  readr::write_csv(
+    rk_cv_metrics_full,
+    file.path(out_folder, "rk_full_cv_metrics.csv")
+  )
+
+  cat(
+    "✔ Validación Regression Kriging completa (RF + OK-LOO) completada.\n"
+  )
 }
 ```
 
 # 14. Preparar grilla para kriging (usar la estructura del raster)
 
 ```{r}
-template_r <- raster::raster(expected_files[1])
-grid_sp <- as(template_r, "SpatialGridDataFrame")
+template_r <- raster::raster(
+  expected_files[1]
+)
+
+template_spat <- rast(
+  expected_files[1]
+)  # SpatRaster 100 m
 ```
 
 # 15. Kriging ordinario de residuos
 
 ```{r}
-gstat_obj <- gstat::gstat(id = "resid", formula = resid ~ 1, data = pts_sp, model = vgm_fit)
-krig_res <- predict(gstat_obj, newdata = grid_sp)
+cat(
+  "Iniciando kriging de residuos (terra::interpolate() con fallback)...\n"
+)
 
-# Convertir a raster y alinear con trend_raster
-krig_raster_r <- raster::raster(krig_res["resid.pred"])
-krig_raster <- terra::rast(krig_raster_r)
-krig_outfile <- file.path(out_folder, "kriging_residuals.tif")
-krig_raster <- terra::resample(krig_raster, trend_raster, method = "bilinear")
-terra::writeRaster(krig_raster, krig_outfile, overwrite = TRUE)
-cat("Raster de residuos krigeados guardado en:", krig_outfile, "\n")
+g_obj <- gstat::gstat(
+  id      = "resid",
+  formula = resid ~ 1,
+  data    = pts_sp,
+  model   = vgm_fit,
+  nmax    = 40
+)
+
+try_terra <- try(
+  {
+    krig_raster <- terra::interpolate(
+      template_spat,
+      g_obj
+    )
+
+    krig_raster <- if (exists("trend_raster")) {
+      terra::resample(
+        krig_raster,
+        trend_raster,
+        method = "bilinear"
+      )
+    } else {
+      krig_raster
+    }
+
+    krig_outfile <- file.path(
+      out_folder,
+      "kriging_residuals_terra.tif"
+    )
+
+    terra::writeRaster(
+      krig_raster,
+      krig_outfile,
+      overwrite = TRUE
+    )
+
+    cat(
+      "✅ Kriging (terra::interpolate) guardado en:",
+      krig_outfile,
+      "\n"
+    )
+
+    TRUE
+  },
+  silent = TRUE
+)
+
+if (inherits(try_terra, "try-error")) {
+
+  cat(
+    "terra::interpolate() falló -> fallback gstat::predict() ",
+    "(nmax reducido, block si es necesario)\n"
+  )
+
+  # Evitar matrices singulares: asegurar nugget mínimo
+  vgm_df <- try(
+    as.data.frame(vgm_fit),
+    silent = TRUE
+  )
+
+  if (
+    !inherits(vgm_df, "try-error") &&
+    any(vgm_df$psill == 0 & vgm_df$range == 0)
+  ) {
+    vgm_fit$psill[1] <- max(
+      1e-6,
+      vgm_fit$psill[1]
+    )
+  }
+
+  # Construir grid seguro
+  grid_pts <- raster::rasterToPoints(
+    template_r,
+    spatial = TRUE
+  )
+
+  grid_sp <- as(
+    grid_pts,
+    "SpatialPixelsDataFrame"
+  )
+
+  names(grid_sp) <- "dummy"
+
+  gstat_obj <- gstat::gstat(
+    id      = "resid",
+    formula = resid ~ 1,
+    data    = pts_sp,
+    model   = vgm_fit,
+    nmax    = 8
+  )
+
+  try_predict <- try(
+    {
+      krig_res <- predict(
+        gstat_obj,
+        newdata = grid_sp
+      )
+      TRUE
+    },
+    silent = TRUE
+  )
+
+  if (inherits(try_predict, "try-error")) {
+
+    cat(
+      "predict() falló, intentando block kriging...\n"
+    )
+
+    krig_res <- predict(
+      gstat_obj,
+      newdata = grid_sp,
+      block   = c(
+        res(template_r)[1] * 2,
+        res(template_r)[2] * 2
+      )
+    )
+  }
+
+  krig_raster_r <- raster::raster(
+    krig_res["resid.pred"]
+  )
+
+  krig_raster <- terra::rast(
+    krig_raster_r
+  )
+
+  if (exists("trend_raster")) {
+    krig_raster <- terra::resample(
+      krig_raster,
+      trend_raster,
+      method = "bilinear"
+    )
+  }
+
+  krig_outfile2 <- file.path(
+    out_folder,
+    "kriging_residuals_gstat.tif"
+  )
+
+  terra::writeRaster(
+    krig_raster,
+    krig_outfile2,
+    overwrite = TRUE
+  )
+
+  cat(
+    "✅ Kriging (fallback gstat) guardado en:",
+    krig_outfile2,
+    "\n"
+  )
+}
+
+if (!exists("krig_raster")) {
+  stop(
+    "Kriging no produjo un raster válido. Revisa logs anteriores."
+  )
+}
 ```
 
 # 16. Sumar tendencia + residuos krigeados = Regression Kriging
 
 ```{r}
-rk_raster <- trend_raster + krig_raster
-rk_outfile <- file.path(out_folder, "RK_SQIw_final.tif")
-terra::writeRaster(rk_raster, rk_outfile, overwrite = TRUE)
-cat("Raster final Regression Kriging guardado en:", rk_outfile, "\n")
+krig_raster_filled <- krig_raster
+krig_raster_filled[is.na(krig_raster_filled)] <- 0
 
-# Adicional: guardar PNG del mapa final (plot del raster)
-rk_png <- file.path(out_folder, "RK_SQIw_final.png")
-png(filename = rk_png, width = 1000, height = 800)
+rk_raster <- trend_raster + krig_raster_filled
+
+rk_outfile <- file.path(
+  out_folder,
+  "RK_SQIw_final.tif"
+)
+
+terra::writeRaster(
+  rk_raster,
+  rk_outfile,
+  overwrite = TRUE
+)
+
+cat(
+  "Raster final Regression Kriging guardado en:",
+  rk_outfile,
+  "\n"
+)
+
+# PNG del mapa final
+rk_png <- file.path(
+  out_folder,
+  "RK_SQIw_final.png"
+)
+
+png(
+  filename = rk_png,
+  width    = 1000,
+  height   = 800
+)
+
 try(
-  {
-    plot(rk_raster, main = "Regression Kriging - SQIw final")
-  },
+  plot(
+    rk_raster,
+    main = "Regression Kriging - SQIw final"
+  ),
   silent = TRUE
 )
+
 dev.off()
-cat("PNG del raster final guardado en:", rk_png, "\n")
+
+cat(
+  "PNG guardado en:",
+  rk_png,
+  "\n"
+)
 ```
 
 # 17. Exportar tablas de CV, métricas y gráficos
 
 ```{r}
-# 17.1 Métricas CV (del entrenamiento) - RF (CV interno)
-cv_rmse <- sqrt(mean((cv_df$pred - cv_df$obs)^2, na.rm = TRUE))
-cv_bias <- mean(cv_df$pred - cv_df$obs, na.rm = TRUE)
-cv_r2 <- cor(cv_df$pred, cv_df$obs, use = "complete.obs")^2
-cv_n <- nrow(cv_df)
-cv_mae <- Metrics::mae(cv_df$obs, cv_df$pred)
+# RF: validación cruzada (train CV)
+# ===============================
+cv_rmse <- sqrt(
+  mean(
+    (cv_df$pred - cv_df$obs)^2,
+    na.rm = TRUE
+  )
+)
+
+cv_bias <- mean(
+  cv_df$pred - cv_df$obs,
+  na.rm = TRUE
+)
+
+cv_r2 <- cor(
+  cv_df$pred,
+  cv_df$obs,
+  use = "complete.obs"
+)^2
+
+cv_n   <- nrow(cv_df)
+cv_mae <- Metrics::mae(
+  cv_df$obs,
+  cv_df$pred
+)
 
 metrics_cv_rf <- data.frame(
   Method = "RF_CV",
-  RMSE = cv_rmse,
-  MAE = cv_mae,
-  BIAS = cv_bias,
-  R2 = cv_r2,
-  PBIAS_pct = 100 * sum(cv_df$pred - cv_df$obs, na.rm = TRUE) / sum(cv_df$obs, na.rm = TRUE),
+  RMSE   = cv_rmse,
+  MAE    = cv_mae,
+  BIAS   = cv_bias,
+  R2     = cv_r2,
+  PBIAS_pct = 100 *
+    sum(
+      cv_df$pred - cv_df$obs,
+      na.rm = TRUE
+    ) /
+    sum(
+      cv_df$obs,
+      na.rm = TRUE
+    ),
   n = cv_n,
   stringsAsFactors = FALSE
 )
 
-# 17.2 Preparar la fila Kriging (si se calculó)
-metrics_cv_krig <- data.frame(
-  Method = "Krig_CV",
-  RMSE = if (!is.null(cv_krig)) krig_cv_metrics$RMSE else NA_real_,
-  MAE = if (!is.null(cv_krig)) krig_cv_metrics$MAE else NA_real_,
-  BIAS = if (!is.null(cv_krig)) krig_cv_metrics$BIAS else NA_real_,
-  R2 = if (!is.null(cv_krig)) krig_cv_metrics$R2 else NA_real_,
-  PBIAS_pct = if (!is.null(cv_krig)) krig_cv_metrics$PBIAS_pct else NA_real_,
-  n = if (!is.null(cv_krig)) krig_cv_metrics$n else NA_integer_,
+# ===============================
+# RK: validación completa (RF + OK-LOO)
+# ===============================
+metrics_cv_rk <- data.frame(
+  Method = "RK_full_CV",
+  RMSE   = if (exists("rk_cv_metrics_full")) rk_cv_metrics_full$RMSE else NA_real_,
+  MAE    = if (exists("rk_cv_metrics_full")) rk_cv_metrics_full$MAE  else NA_real_,
+  BIAS   = if (exists("rk_cv_metrics_full")) rk_cv_metrics_full$BIAS else NA_real_,
+  R2     = if (exists("rk_cv_metrics_full")) rk_cv_metrics_full$R2   else NA_real_,
+  PBIAS_pct = if (exists("rk_cv_metrics_full")) rk_cv_metrics_full$PBIAS_pct else NA_real_,
+  n = if (exists("rk_cv_metrics_full")) rk_cv_metrics_full$n else NA_integer_,
   stringsAsFactors = FALSE
 )
 
-# 17.3 Agregar columnas de variograma a la fila Kriging (y a RF con NA)
+# ===============================
+# Parámetros del variograma
+# ===============================
 vg_cols <- data.frame(
-  Nugget = vgm_params_table$nugget,
-  Psill = vgm_params_table$psill,
-  Sill = vgm_params_table$sill,
-  Range = vgm_params_table$range,
+  Nugget  = vgm_params_table$nugget,
+  Psill   = vgm_params_table$psill,
+  Sill    = vgm_params_table$sill,
+  Range   = vgm_params_table$range,
   PSV_pct = vgm_params_table$PSV_pct,
   stringsAsFactors = FALSE
 )
 
-metrics_cv_rf_full <- cbind(metrics_cv_rf, vg_cols[rep(1, nrow(metrics_cv_rf)), , drop = FALSE])
-metrics_cv_krig_full <- cbind(metrics_cv_krig, vg_cols)
+# ===============================
+# Unir métricas + variograma
+# ===============================
+metrics_cv_rf_full <- cbind(
+  metrics_cv_rf,
+  vg_cols[rep(1, nrow(metrics_cv_rf)), , drop = FALSE]
+)
 
-# 17.4 Unir filas RF_CV y Krig_CV y guardar en cv_metrics_summary.csv
-cv_metrics_summary <- rbind(metrics_cv_rf_full, metrics_cv_krig_full)
+metrics_cv_rk_full <- cbind(
+  metrics_cv_rk,
+  vg_cols[rep(1, nrow(metrics_cv_rk)), , drop = FALSE]
+)
 
-# Renombrar columnas a estilo 'opción 2' (guion bajo)
+cv_metrics_summary <- rbind(
+  metrics_cv_rf_full,
+  metrics_cv_rk_full
+)
+
 names(cv_metrics_summary) <- c(
   "Method", "RMSE", "MAE", "BIAS", "R2", "PBIAS_pct", "n",
   "Nugget", "Psill", "Sill", "Range", "PSV_pct"
 )
 
-readr::write_csv(cv_metrics_summary, file.path(out_folder, "cv_metrics_summary.csv"))
-cat("Archivo central cv_metrics_summary.csv guardado en:", file.path(out_folder, "cv_metrics_summary.csv"), "\n")
+readr::write_csv(
+  cv_metrics_summary,
+  file.path(out_folder, "cv_metrics_summary.csv")
+)
 
-# 17.5 Guardar tablas auxiliares
-readr::write_csv(cv_df, file.path(out_folder, "cv_predictions_detailed.csv"))
-readr::write_csv(pts_df, file.path(out_folder, "points_with_predictors_and_response.csv"))
+cat(
+  "Archivo central cv_metrics_summary.csv guardado en:",
+  file.path(out_folder, "cv_metrics_summary.csv"),
+  "\n"
+)
 
-# 17.6 Gráficos Observed vs Pred - Test y CV
-p_test <- ggplot2::ggplot(data = test_table, aes(x = observed, y = predicted)) +
+# ===============================
+# Exportar predicciones y datos
+# ===============================
+readr::write_csv(
+  cv_df,
+  file.path(out_folder, "cv_predictions_detailed.csv")
+)
+
+readr::write_csv(
+  pts_df,
+  file.path(out_folder, "points_with_predictors_and_response.csv")
+)
+
+# ===============================
+# Gráficos
+# ===============================
+p_test <- ggplot2::ggplot(
+  data = test_table,
+  aes(x = observed, y = predicted)
+) +
   geom_point() +
-  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  geom_abline(
+    slope     = 1,
+    intercept = 0,
+    linetype  = "dashed"
+  ) +
   ggtitle("Observed vs Predicted (Test 20%)") +
   xlab("Observado") +
   ylab("Predicho")
-ggsave(filename = file.path(out_folder, "obs_vs_pred_test.png"), plot = p_test, width = 6, height = 5)
 
-p_cv <- ggplot2::ggplot(data = cv_df, aes(x = obs, y = pred)) +
+ggsave(
+  filename = file.path(out_folder, "obs_vs_pred_test.png"),
+  plot     = p_test,
+  width    = 6,
+  height   = 5
+)
+
+p_cv <- ggplot2::ggplot(
+  data = cv_df,
+  aes(x = obs, y = pred)
+) +
   geom_point() +
-  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  geom_abline(
+    slope     = 1,
+    intercept = 0,
+    linetype  = "dashed"
+  ) +
   ggtitle("Observed vs Predicted (CV interno train)") +
   xlab("Observado") +
   ylab("Predicho")
-ggsave(filename = file.path(out_folder, "obs_vs_pred_cv.png"), plot = p_cv, width = 6, height = 5)
-```
 
-# 18. Resumen final y archivos
+ggsave(
+  filename = file.path(out_folder, "obs_vs_pred_cv.png"),
+  plot     = p_cv,
+  width    = 6,
+  height   = 5
+)
 
-```{r}
 cat("\n--- Proceso completado ---\n")
-cat("Archivos exportados en:", normalizePath(out_folder), "\n")
-cat("- trend_RF.tif\n- kriging_residuals.tif\n- RK_SQIw_final.tif (GeoTIFF)\n- RK_SQIw_final.png (PNG)\n- cv_predictions_train.csv (detallado)\n- cv_metrics_summary.csv (RF_CV + Krig_CV)\n- krige_cv_detailed.csv\n- krige_cv_metrics_summary.csv\n- variograma_empirico.csv\n- variograma_parametros.csv\n- variograma_empirico_ajustado.png\n- test_predicted_vs_observed.csv\n- obs_vs_pred_test.png\n- obs_vs_pred_cv.png\n\n")
-
-# (Opcional) Mostrar mapas interactivos si estás en entorno con GUI
-if (requireNamespace("mapview", quietly = TRUE)) {
-  try(
-    {
-      mapview::mapview(trend_raster, layer.name = "Tendencia_RF") +
-        mapview::mapview(krig_raster, layer.name = "Residuos_Kriging") +
-        mapview::mapview(rk_raster, layer.name = "SQIw_Final")
-    },
-    silent = TRUE
-  )
-}
+cat(
+  "Archivos exportados en:",
+  normalizePath(out_folder),
+  "\n"
+)
 ```
-
 
 # References
 
