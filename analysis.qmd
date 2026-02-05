@@ -1239,6 +1239,51 @@ cat(
 )
 ```
 
+# 18. Metricas adicionales
+
+```{r}
+rf_metrics_by_fold <- cv_df %>%
+  group_by(Resample) %>%   # cada fold
+  summarise(
+    RMSE = Metrics::rmse(obs, pred),
+    MAE  = Metrics::mae(obs, pred),
+    R2   = cor(obs, pred, use = "complete.obs")^2
+  )
+
+rf_summary <- rf_metrics_by_fold %>%
+  summarise(
+    RMSE_mean = mean(RMSE),
+    RMSE_sd   = sd(RMSE),
+    MAE_mean  = mean(MAE),
+    MAE_sd    = sd(MAE),
+    R2_mean   = mean(R2),
+    R2_sd     = sd(R2)
+  )
+
+rf_summary
+
+```
+
+```{r}
+# Errores RK solo donde existe predicción válida
+rk_errors <- obs_vals[valid_idx] - rk_pred_points[valid_idx]
+
+rk_summary <- data.frame(
+  RMSE_mean = sqrt(mean(rk_errors^2)),
+  RMSE_sd   = sd(abs(rk_errors)),
+  MAE_mean  = mean(abs(rk_errors)),
+  MAE_sd    = sd(abs(rk_errors)),
+  R2_mean   = cor(obs_vals[valid_idx], rk_pred_points[valid_idx])^2,
+  R2_sd     = sd(
+    (obs_vals[valid_idx] - mean(obs_vals[valid_idx])) *
+    (rk_pred_points[valid_idx] - mean(rk_pred_points[valid_idx]))
+  )
+)
+
+rk_summary
+```
+
+
 # References
 
 Broman, K. W., & Woo, K. H. (2017). Data organization in spreadsheets. The American Statistician, 72(1), 2–10. https://doi.org/10.1080/00031305.2017.1375989
