@@ -1,0 +1,8 @@
+{
+"type": "FeatureCollection",
+"name": "MORROPON_UTM17S",
+"crs": { "type": "name", "properties": { "name": "urn:ogc:def:crs:EPSG::32717" } },
+"features": [
+{ "type": "Feature", "properties": { "id": "00060000000000000eac", "ADM0_CODE": 195, "ADM0_NAME": "Peru", "ADM1_CODE": 2347, "ADM1_NAME": "Piura", "ADM2_CODE": 24159, "ADM2_NAME": "Morropón", "DISP_AREA": "NO", "EXP2_YEAR": 3000, "STATUS": "Member State", "STR2_YEAR": 1000, "Shape_Area": 0.31093832476900002, "Shape_Leng": 3.4053587798799998 }, "geometry": { "type": "Polygon", "coordinates": [ ] } }
+]
+}
