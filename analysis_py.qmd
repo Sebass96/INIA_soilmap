@@ -1,0 +1,1673 @@
+---
+title: "Hybrid machine learning–geostatistical modelling of soil quality in saline, sodic and alkaline soils under arid agroecosystems"
+format:
+  html:
+    toc: true
+    toc-expand: true
+    toc-depth: 4
+    toc-location: left
+    number-sections: true
+    self-contained: true
+    code-fold: true
+    output-file: "ESM_1"
+editor_options: 
+  chunk_output_type: console
+execute: 
+  warning: false
+  message: false
+  eval: false
+  echo: true
+---
+<!--
+# RANDOM CV – SQIw
+Comparación de modelos:
+1) Ordinary Kriging (OK)            -> baseline geoestadístico
+2) RandomForest (Optuna)            -> ML
+3) RandomForest + Residual Kriging  -> ML + RK
+
+> CV: Random KFold (shuffle=True) - mismos folds para todo
+> Métricas por fold: RMSE / MAE / R2
+> Test por métrica: Friedman + Nemenyi + letras (CLD)
+-->
+# Performance Analysis under Random Cross-Validation for SQIw
+
+## Project Setup
+
+```{python}
+import os
+import warnings
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import rasterio
+import matplotlib.pyplot as plt
+import optuna
+
+from sklearn.model_selection import KFold
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+from pykrige.ok import OrdinaryKriging
+
+from scipy.stats import friedmanchisquare
+from scipy.spatial.distance import pdist
+from scipy.optimize import curve_fit
+
+import scikit_posthocs as sp
+
+warnings.filterwarnings("ignore", category=UserWarning)
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+```
+
+## General Computational Settings
+
+```{python}
+points_file = "JSON/soil_samples.geojson"
+covariables_folder = "Covariables"
+target_var = "SQIw"
+crs_target = 32717
+
+# CV externa
+k_folds_outer = 5
+random_seed = 42
+alpha = 0.05
+
+# CV interna para Optuna
+k_folds_inner = 3
+n_trials_optuna = 60
+optuna_timeout = None   
+
+# Variogramas para kriging
+variogram_model_cv = "spherical"
+variogram_models_fallback = ["spherical", "exponential", "gaussian"]
+
+# Variograma experimental
+n_lags = 15
+maxlag_frac = 0.5
+min_pairs_per_bin = 30
+
+# Variables raster
+predictor_names = [
+    "Elevation", "EVI2", "GCI", "Slope", "Orientation", "Hillshade",
+    "NBR", "NDMI", "TPI", "TRI", "TWI", "NDVI", "SAVI", "NDWI",
+    "Precipitation", "Temperature"
+]
+
+out_folder = "paper_outputs_xy_optuna"
+os.makedirs(out_folder, exist_ok=True)
+```
+
+## Utility Functions
+
+```{python}
+def rmse_func(y_true, y_pred):
+    return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+
+def metrics(y_true, y_pred):
+    rmse = rmse_func(y_true, y_pred)
+    mae = float(mean_absolute_error(y_true, y_pred))
+    r2 = float(r2_score(y_true, y_pred))
+    return rmse, mae, r2
+
+def extract_raster_values(raster_path, points_xy):
+    with rasterio.open(raster_path) as src:
+        vals = [v[0] for v in src.sample(points_xy)]
+    return np.asarray(vals, dtype="float64")
+
+def fit_ok_and_predict(coords_train, values_train, coords_test,
+                       variogram_model="spherical",
+                       fallback_models=("spherical", "exponential", "gaussian")):
+    """
+    Ajusta Ordinary Kriging y predice en puntos. Si falla, prueba modelos alternativos.
+    """
+    models_to_try = [variogram_model] + [m for m in fallback_models if m != variogram_model]
+    last_err = None
+
+    for vm in models_to_try:
+        try:
+            ok = OrdinaryKriging(
+                coords_train[:, 0],
+                coords_train[:, 1],
+                values_train,
+                variogram_model=vm,
+                verbose=False,
+                enable_plotting=False
+            )
+            pred, _ = ok.execute("points", coords_test[:, 0], coords_test[:, 1])
+            return np.asarray(pred).ravel(), vm
+        except Exception as e:
+            last_err = e
+            continue
+
+    raise RuntimeError(
+        f"OrdinaryKriging falló con {models_to_try}. Último error: {last_err}"
+    )
+
+def experimental_variogram(coords_xy, values, n_lags=15, maxlag=None, maxlag_frac=0.5):
+    """
+    Calcula variograma experimental clásico:
+      gamma(h) = 0.5 * E[(Z(x)-Z(x+h))^2]
+    """
+    coords_xy = np.asarray(coords_xy, dtype="float64")
+    values = np.asarray(values, dtype="float64")
+
+    dists = pdist(coords_xy)
+    diffs = pdist(values[:, None])
+    semivar = 0.5 * (diffs ** 2)
+
+    dmax = float(dists.max())
+    if maxlag is None:
+        maxlag = maxlag_frac * dmax
+
+    mask = dists <= maxlag
+    dists = dists[mask]
+    semivar = semivar[mask]
+
+    bin_edges = np.linspace(0.0, maxlag, n_lags + 1)
+    h_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+    gamma = np.full(n_lags, np.nan, dtype="float64")
+    npairs = np.zeros(n_lags, dtype="int64")
+
+    bin_idx = np.digitize(dists, bin_edges) - 1
+    valid_bins = (bin_idx >= 0) & (bin_idx < n_lags)
+    bin_idx = bin_idx[valid_bins]
+    semivar = semivar[valid_bins]
+
+    for k in range(n_lags):
+        sel = (bin_idx == k)
+        npairs[k] = int(sel.sum())
+        if npairs[k] > 0:
+            gamma[k] = float(np.mean(semivar[sel]))
+
+    ok = ~np.isnan(gamma)
+    return h_centers[ok], gamma[ok], npairs[ok], bin_edges
+
+def vario_spherical(h, nugget, psill, rang):
+    h = np.asarray(h, dtype="float64")
+    hr = h / rang
+    out = np.empty_like(h)
+
+    inside = h <= rang
+    out[inside] = nugget + psill * (1.5 * hr[inside] - 0.5 * (hr[inside] ** 3))
+    out[~inside] = nugget + psill
+    return out
+
+def vario_exponential(h, nugget, psill, rang):
+    h = np.asarray(h, dtype="float64")
+    return nugget + psill * (1.0 - np.exp(-h / rang))
+
+def vario_gaussian(h, nugget, psill, rang):
+    h = np.asarray(h, dtype="float64")
+    return nugget + psill * (1.0 - np.exp(-(h / rang) ** 2))
+
+```
+
+## Data Loading: Sampling Points
+
+```{python}
+print("\n[1/3] Cargando puntos...")
+
+gdf = gpd.read_file(points_file)
+
+if gdf.crs is None:
+    gdf = gdf.set_crs(crs_target)
+else:
+    epsg = gdf.crs.to_epsg()
+    if epsg != crs_target:
+        gdf = gdf.to_crs(crs_target)
+
+if target_var not in gdf.columns:
+    raise ValueError(f"No encuentro '{target_var}' en el GeoJSON. Columnas: {list(gdf.columns)}")
+
+coords = np.column_stack([gdf.geometry.x.values, gdf.geometry.y.values]).astype("float64")
+y = gdf[target_var].to_numpy(dtype="float64")
+```
+
+## Extraction of Raster Values
+
+```{python}
+print("[2/3] Extrayendo covariables raster...")
+
+X_list = []
+for var in predictor_names:
+    raster_path = os.path.join(covariables_folder, f"{var}.tif")
+    if not os.path.exists(raster_path):
+        raise FileNotFoundError(f"Falta raster: {raster_path}")
+    vals = extract_raster_values(raster_path, coords)
+    X_list.append(vals)
+
+X_env = np.column_stack(X_list)
+X = np.column_stack([X_env, coords])  # agrega Xcoord, Ycoord
+feature_names = predictor_names + ["Xcoord", "Ycoord"]
+```
+
+## Data Cleaning: Handling Missing Values
+
+```{python}
+print("[3/3] Limpiando registros con NA...")
+
+mask_valid = (~np.isnan(X).any(axis=1)) & (~np.isnan(y))
+X = X[mask_valid]
+y = y[mask_valid]
+coords = coords[mask_valid]
+gdf = gdf.iloc[mask_valid].reset_index(drop=True)
+
+print(f"✅ Puntos válidos: {len(y)}")
+print(f"✅ Número total de predictores: {X.shape[1]}")
+```
+
+## Hyperparameter Optimization of Random Forest Using Optuna (Random Cross-Validation) 
+
+```{python}
+from sklearn.model_selection import train_test_split
+
+def optimize_rf_with_optuna(
+    X,
+    y,
+    splits,
+    seed,
+    n_trials,
+    timeout=None
+):
+    def eval_rf_rmse(params):
+        rmses = []
+
+        for train_idx, test_idx in splits:
+            X_train_cv, X_test_cv = X[train_idx], X[test_idx]
+            y_train_cv, y_test_cv = y[train_idx], y[test_idx]
+
+            rf = RandomForestRegressor(
+                n_estimators=params["n_estimators"],
+                max_depth=params["max_depth"],
+                min_samples_split=params["min_samples_split"],
+                min_samples_leaf=params["min_samples_leaf"],
+                max_features=params["max_features"],
+                bootstrap=params["bootstrap"],
+                random_state=seed,
+                n_jobs=-1
+            )
+            rf.fit(X_train_cv, y_train_cv)
+            pred_cv = rf.predict(X_test_cv)
+
+            rmses.append(float(np.sqrt(mean_squared_error(y_test_cv, pred_cv))))
+
+        return float(np.mean(rmses))
+
+    def objective(trial):
+        params = {
+            "n_estimators": trial.suggest_int("n_estimators", 200, 2000, step=100),
+            "max_depth": trial.suggest_int("max_depth", 4, 40),
+            "min_samples_split": trial.suggest_int("min_samples_split", 2, 20),
+            "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 10),
+            "max_features": trial.suggest_categorical(
+                "max_features",
+                ["sqrt", "log2", 0.5, 0.7, 1.0]
+            ),
+            "bootstrap": trial.suggest_categorical("bootstrap", [True, False]),
+        }
+        return eval_rf_rmse(params)
+
+    study = optuna.create_study(
+        direction="minimize",
+        sampler=optuna.samplers.TPESampler(seed=seed)
+    )
+    study.optimize(objective, n_trials=n_trials, timeout=timeout, show_progress_bar=False)
+
+    best_params = study.best_trial.params.copy()
+    best_params["random_state"] = seed
+    best_params["n_jobs"] = -1
+
+    return best_params, study.best_value, study
+```
+
+## Cross-Validation Strategy
+
+```{python}
+kf_outer = KFold(n_splits=k_folds_outer, shuffle=True, random_state=random_seed)
+splits = list(kf_outer.split(X))
+
+rows = []
+
+# Residuales OOF para variogramas experimentales
+resid_oof_ok = np.full_like(y, fill_value=np.nan, dtype="float64")
+resid_oof_rf = np.full_like(y, fill_value=np.nan, dtype="float64")
+resid_oof_rk = np.full_like(y, fill_value=np.nan, dtype="float64")
+
+# Predicciones OOF
+pred_oof_ok = np.full_like(y, fill_value=np.nan, dtype="float64")
+pred_oof_rf = np.full_like(y, fill_value=np.nan, dtype="float64")
+pred_oof_rk = np.full_like(y, fill_value=np.nan, dtype="float64")
+
+# ------------------------------------------------------------
+# Optuna para RF
+# ------------------------------------------------------------
+print("\n🚀 Optuna: RandomForest")
+
+best_rf_params, best_cv_rmse, study_rf = optimize_rf_with_optuna(
+    X=X,
+    y=y,
+    splits=splits,
+    seed=random_seed,
+    n_trials=n_trials_optuna,
+    timeout=optuna_timeout
+)
+
+print("\n=== MEJOR RF (Optuna + Random CV) ===")
+print("Best CV RMSE:", best_cv_rmse)
+print("Best params:", best_rf_params)
+
+best_params_rows = [{
+    "best_cv_rmse": best_cv_rmse,
+    **best_rf_params
+}]
+
+# ------------------------------------------------------------
+# Evaluación final
+# ------------------------------------------------------------
+for fold_id, (train_idx, test_idx) in enumerate(splits, start=1):
+    
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
+    coords_train, coords_test = coords[train_idx], coords[test_idx]
+
+    # --------------------------------------------------------
+    # (1) OK
+    # --------------------------------------------------------
+    pred_ok, vm_ok = fit_ok_and_predict(
+        coords_train=coords_train,
+        values_train=y_train,
+        coords_test=coords_test,
+        variogram_model=variogram_model_cv,
+        fallback_models=tuple(variogram_models_fallback)
+    )
+
+    pred_oof_ok[test_idx] = pred_ok
+    resid_oof_ok[test_idx] = y_test - pred_ok
+
+    rmse_ok, mae_ok, r2_ok = metrics(y_test, pred_ok)
+    rows.append([fold_id, "OrdinaryKriging", rmse_ok, mae_ok, r2_ok, vm_ok])
+
+    # --------------------------------------------------------
+    # (2) RF con mejores hiperparámetros globales de Optuna
+    # --------------------------------------------------------
+    rf = RandomForestRegressor(**best_rf_params)
+    rf.fit(X_train, y_train)
+
+    pred_rf = rf.predict(X_test)
+    pred_oof_rf[test_idx] = pred_rf
+    resid_oof_rf[test_idx] = y_test - pred_rf
+
+    rmse_rf, mae_rf, r2_rf = metrics(y_test, pred_rf)
+    rows.append([fold_id, "RandomForest_XY", rmse_rf, mae_rf, r2_rf, "NA"])
+
+    # --------------------------------------------------------
+    # (3) RF + RK
+    # --------------------------------------------------------
+    resid_rf_train = y_train - rf.predict(X_train)
+
+    krig_resid_rf, vm_rk = fit_ok_and_predict(
+        coords_train=coords_train,
+        values_train=resid_rf_train,
+        coords_test=coords_test,
+        variogram_model=variogram_model_cv,
+        fallback_models=tuple(variogram_models_fallback)
+    )
+
+    pred_rf_rk = pred_rf + krig_resid_rf
+
+    pred_oof_rk[test_idx] = pred_rf_rk
+    resid_oof_rk[test_idx] = y_test - pred_rf_rk
+
+    rmse_rk, mae_rk, r2_rk = metrics(y_test, pred_rf_rk)
+    rows.append([fold_id, "RandomForest_XY+RK", rmse_rk, mae_rk, r2_rk, vm_rk])
+
+# ------------------------------------------------------------
+#  Guardar métricas por fold
+# ------------------------------------------------------------
+df_folds = pd.DataFrame(
+    rows,
+    columns=["fold", "model", "RMSE", "MAE", "R2", "variogram_used"]
+)
+df_folds.to_csv(os.path.join(out_folder, "cv_metrics_by_fold.csv"), index=False)
+
+# Guardar mejores hiperparámetros globales de RF
+df_best_params = pd.DataFrame(best_params_rows)
+df_best_params.to_csv(os.path.join(out_folder, "rf_best_params_randomcv.csv"), index=False)
+
+print("\n=== CV métricas por fold ===")
+print(df_folds.head(12))
+
+summary = df_folds.groupby("model")[["RMSE", "MAE", "R2"]].agg(["mean", "std"])
+summary.to_csv(os.path.join(out_folder, "cv_summary_mean_std.csv"))
+
+print("\n=== Resumen mean ± std ===")
+print(summary)
+```
+
+## Model Comparison Using Friedman and Nemenyi Tests with Compact Letter Display (CLD)
+
+```{python}
+print("\n Ejecutando Friedman + Nemenyi + letras...")
+
+models = ["OrdinaryKriging", "RandomForest_XY", "RandomForest_XY+RK"]
+
+def metric_pivot(df, metric, model_order):
+    pv = df.pivot_table(index="fold", columns="model", values=metric, aggfunc="mean")
+    pv = pv.loc[:, model_order]
+    if pv.isna().any().any():
+        raise ValueError(f"Hay NaNs en el pivot de {metric}.")
+    return pv
+
+def friedman_test_from_pivot(pivot_df):
+    arrays = [pivot_df[c].to_numpy() for c in pivot_df.columns]
+    return float(friedmanchisquare(*arrays).pvalue)
+
+def nemenyi_from_pivot(pivot_df):
+    pvals = sp.posthoc_nemenyi_friedman(pivot_df.values)
+    pvals.index = pivot_df.columns
+    pvals.columns = pivot_df.columns
+    return pvals
+
+def cld_letters_from_pvals(pvals, means, alpha=0.05, higher_is_better=False):
+    order = means.sort_values(ascending=not higher_is_better).index.tolist()
+    letters = {m: "" for m in order}
+    groups = []
+    alphabet = "abcdefghijklmnopqrstuvwxyz"
+
+    for m in order:
+        placed = False
+        for g in groups:
+            ok_group = True
+            for other in g["members"]:
+                if pvals.loc[m, other] < alpha:
+                    ok_group = False
+                    break
+            if ok_group:
+                letters[m] += g["letter"]
+                g["members"].append(m)
+                placed = True
+                break
+
+        if not placed:
+            letter = alphabet[len(groups)]
+            groups.append({"letter": letter, "members": [m]})
+            letters[m] += letter
+
+    return letters
+
+results_stats = {}
+
+for metric, higher_is_better in [("RMSE", False), ("MAE", False), ("R2", True)]:
+    pv = metric_pivot(df_folds, metric, models)
+    p_f = friedman_test_from_pivot(pv)
+    pvals = nemenyi_from_pivot(pv)
+    means = pv.mean(axis=0)
+    letters = cld_letters_from_pvals(pvals, means, alpha=alpha, higher_is_better=higher_is_better)
+
+    results_stats[metric] = {
+        "friedman_p": p_f,
+        "nemenyi_pvals": pvals,
+        "means": means,
+        "letters": letters
+    }
+
+    print(f"\n================ {metric} ================")
+    print(f"Friedman p-value: {p_f:.6f}")
+    print("Medias:")
+    print(means.sort_values(ascending=not higher_is_better))
+    print("Letras:")
+    for m in means.sort_values(ascending=not higher_is_better).index:
+        print(f"  {m:20s} -> ({letters[m]})")
+
+    pvals.to_csv(os.path.join(out_folder, f"nemenyi_{metric}.csv"))
+
+def format_mean_std_letter(model, metric):
+    m = summary.loc[model, (metric, "mean")]
+    s = summary.loc[model, (metric, "std")]
+    letter = results_stats[metric]["letters"][model]
+    return f"{m:.4f} ± {s:.4f} ({letter})"
+
+final_table = pd.DataFrame(index=models, columns=["RMSE", "MAE", "R2"])
+for m in models:
+    final_table.loc[m, "RMSE"] = format_mean_std_letter(m, "RMSE")
+    final_table.loc[m, "MAE"] = format_mean_std_letter(m, "MAE")
+    final_table.loc[m, "R2"] = format_mean_std_letter(m, "R2")
+
+final_table.to_csv(os.path.join(out_folder, "final_table_meanstd_letters.csv"))
+
+print("\n=== Tabla final ===")
+final_table
+```
+
+```{python}
+#| eval: true
+
+import pandas as pd
+
+df = pd.read_csv("paper_outputs_xy_optuna/final_table_meanstd_letters.csv", index_col=0)
+
+df.style.set_properties(**{
+    'text-align': 'center'
+}).set_table_styles([
+    {'selector': 'th', 'props': [('text-align', 'center')]}
+])
+```
+
+## Experimental Variogram Analysis 
+
+```{python}
+if np.isnan(y).any():
+    raise RuntimeError("Hay NaNs en y.")
+if np.isnan(resid_oof_ok).any():
+    raise RuntimeError("Hay NaNs en resid_oof_ok.")
+if np.isnan(resid_oof_rf).any():
+    raise RuntimeError("Hay NaNs en resid_oof_rf.")
+if np.isnan(resid_oof_rk).any():
+    raise RuntimeError("Hay NaNs en resid_oof_rk.")
+
+# Usar el mismo maxlag para todas las series
+dmax_all = float(pdist(coords).max())
+common_maxlag = maxlag_frac * dmax_all
+
+# ------------------------------------------------------------
+# Variograma experimental de SQIw
+# ------------------------------------------------------------
+h_sqiw, g_sqiw, npairs_sqiw, bin_edges_sqiw = experimental_variogram(
+    coords_xy=coords,
+    values=y,
+    n_lags=n_lags,
+    maxlag=common_maxlag,
+    maxlag_frac=maxlag_frac
+)
+
+# ------------------------------------------------------------
+# Variograma experimental de residuales OOF de OK
+# ------------------------------------------------------------
+h_ok, g_ok, npairs_ok, bin_edges_ok = experimental_variogram(
+    coords_xy=coords,
+    values=resid_oof_ok,
+    n_lags=n_lags,
+    maxlag=common_maxlag,
+    maxlag_frac=maxlag_frac
+)
+
+# ------------------------------------------------------------
+# Variograma experimental de residuales OOF de RF
+# ------------------------------------------------------------
+h_rf, g_rf, npairs_rf, bin_edges_rf = experimental_variogram(
+    coords_xy=coords,
+    values=resid_oof_rf,
+    n_lags=n_lags,
+    maxlag=common_maxlag,
+    maxlag_frac=maxlag_frac
+)
+
+# ------------------------------------------------------------
+# Variograma experimental de residuales OOF de RF+RK
+# ------------------------------------------------------------
+h_rk, g_rk, npairs_rk, bin_edges_rk = experimental_variogram(
+    coords_xy=coords,
+    values=resid_oof_rk,
+    n_lags=n_lags,
+    maxlag=common_maxlag,
+    maxlag_frac=maxlag_frac
+)
+
+# ------------------------------------------------------------
+# Resumen en consola
+# ------------------------------------------------------------
+print("\n=== Variograma experimental - SQIw ===")
+print(f"Bins efectivos: {len(h_sqiw)}")
+print(f"Maxlag (m): {common_maxlag:.2f}")
+print("Pares por bin (min/med/max):",
+      int(np.min(npairs_sqiw)), int(np.median(npairs_sqiw)), int(np.max(npairs_sqiw)))
+
+print("\n=== Variograma experimental OOF - OK ===")
+print(f"Bins efectivos: {len(h_ok)}")
+print(f"Maxlag (m): {common_maxlag:.2f}")
+print("Pares por bin (min/med/max):",
+      int(np.min(npairs_ok)), int(np.median(npairs_ok)), int(np.max(npairs_ok)))
+
+print("\n=== Variograma experimental OOF - RF ===")
+print(f"Bins efectivos: {len(h_rf)}")
+print(f"Maxlag (m): {common_maxlag:.2f}")
+print("Pares por bin (min/med/max):",
+      int(np.min(npairs_rf)), int(np.median(npairs_rf)), int(np.max(npairs_rf)))
+
+print("\n=== Variograma experimental OOF - RF+RK ===")
+print(f"Bins efectivos: {len(h_rk)}")
+print(f"Maxlag (m): {common_maxlag:.2f}")
+print("Pares por bin (min/med/max):",
+      int(np.min(npairs_rk)), int(np.median(npairs_rk)), int(np.max(npairs_rk)))
+
+if np.min(npairs_sqiw) < min_pairs_per_bin:
+    print(f"⚠️ SQIw: hay bins con menos de {min_pairs_per_bin} pares.")
+if np.min(npairs_ok) < min_pairs_per_bin:
+    print(f"⚠️ OK: hay bins con menos de {min_pairs_per_bin} pares.")
+if np.min(npairs_rf) < min_pairs_per_bin:
+    print(f"⚠️ RF: hay bins con menos de {min_pairs_per_bin} pares.")
+if np.min(npairs_rk) < min_pairs_per_bin:
+    print(f"⚠️ RF+RK: hay bins con menos de {min_pairs_per_bin} pares.")
+
+# ------------------------------------------------------------
+# Guardar tablas por separado
+# ------------------------------------------------------------
+df_vario_sqiw = pd.DataFrame({
+    "h_center": h_sqiw,
+    "gamma_exp": g_sqiw,
+    "npairs": npairs_sqiw[:len(h_sqiw)],
+    "series": "SQIw"
+})
+
+df_vario_ok = pd.DataFrame({
+    "h_center": h_ok,
+    "gamma_exp": g_ok,
+    "npairs": npairs_ok[:len(h_ok)],
+    "series": "OK_residuals"
+})
+
+df_vario_rf = pd.DataFrame({
+    "h_center": h_rf,
+    "gamma_exp": g_rf,
+    "npairs": npairs_rf[:len(h_rf)],
+    "series": "RF_residuals"
+})
+
+df_vario_rk = pd.DataFrame({
+    "h_center": h_rk,
+    "gamma_exp": g_rk,
+    "npairs": npairs_rk[:len(h_rk)],
+    "series": "RF_RK_residuals"
+})
+
+df_vario_sqiw.to_csv(os.path.join(out_folder, "variogram_experimental_SQIw.csv"), index=False)
+df_vario_ok.to_csv(os.path.join(out_folder, "variogram_experimental_OK_oof.csv"), index=False)
+df_vario_rf.to_csv(os.path.join(out_folder, "variogram_experimental_RF_oof.csv"), index=False)
+df_vario_rk.to_csv(os.path.join(out_folder, "variogram_experimental_RK_oof.csv"), index=False)
+
+# ------------------------------------------------------------
+# 9.7 Guardar también en formato largo (las 4 series juntas)
+# ------------------------------------------------------------
+df_vario_all = pd.concat(
+    [df_vario_sqiw, df_vario_ok, df_vario_rf, df_vario_rk],
+    axis=0,
+    ignore_index=True
+)
+
+df_vario_all.to_csv(os.path.join(out_folder, "variogram_experimental_all_series.csv"), index=False)
+
+print("\n✅ Archivos guardados:")
+print(" - variogram_experimental_SQIw.csv")
+print(" - variogram_experimental_OK_oof.csv")
+print(" - variogram_experimental_RF_oof.csv")
+print(" - variogram_experimental_RK_oof.csv")
+print(" - variogram_experimental_all_series.csv")
+```
+
+## Visualization of Experimental Variograms
+
+```{python}
+print("\n Graficando variogramas experimentales...")
+
+# ------------------------------------------------------------
+#  Gráfico con las 4 series: SQIw, OK, RF, RF+RK
+# ------------------------------------------------------------
+plt.figure(figsize=(10, 6))
+
+plt.plot(h_sqiw, g_sqiw, marker="o", linewidth=1.8, label="SQIw")
+plt.plot(h_ok,   g_ok,   marker="s", linewidth=1.8, label="Residuals OK")
+plt.plot(h_rf,   g_rf,   marker="^", linewidth=1.8, label="Residuals RF")
+plt.plot(h_rk,   g_rk,   marker="D", linewidth=1.8, label="Residuals RF+RK")
+
+plt.xlabel("Distance h")
+plt.ylabel("Semivariance γ(h)")
+plt.title("Comparison of experimental variograms: SQIw and residuals")
+plt.grid(True, alpha=0.3)
+plt.legend()
+plt.tight_layout()
+
+plot_path_all = os.path.join(out_folder, "variogram_experimental_4series.jpg")
+plt.savefig(plot_path_all, dpi=600, bbox_inches="tight")
+plt.close()
+
+# ------------------------------------------------------------
+# Gráfico solo de residuales: OK, RF, RF+RK
+# ------------------------------------------------------------
+plt.figure(figsize=(10, 6))
+
+plt.plot(h_ok, g_ok, marker="s", linewidth=1.8, label="Residuals OK")
+plt.plot(h_rf, g_rf, marker="^", linewidth=1.8, label="Residuals RF")
+plt.plot(h_rk, g_rk, marker="D", linewidth=1.8, label="Residuals RF+RK")
+
+plt.xlabel("Distance h")
+plt.ylabel("Semivariance γ(h)")
+plt.title("Comparison of experimental variograms: residuals")
+plt.grid(True, alpha=0.3)
+plt.legend()
+plt.tight_layout()
+
+plot_path_resid = os.path.join(out_folder, "variogram_experimental_residuals_only.jpg")
+plt.savefig(plot_path_resid, dpi=600, bbox_inches="tight")
+plt.close()
+
+# ============================================================
+# GUARDAR PREDICCIONES Y RESIDUALES OOF
+# ============================================================
+print(" Guardando predicciones y residuales OOF...")
+
+df_oof = pd.DataFrame({
+    "y_true": y,
+    "pred_OK": pred_oof_ok,
+    "pred_RF": pred_oof_rf,
+    "pred_RF_RK": pred_oof_rk,
+    "resid_OK": resid_oof_ok,
+    "resid_RF": resid_oof_rf,
+    "resid_RF_RK": resid_oof_rk,
+    "Xcoord": coords[:, 0],
+    "Ycoord": coords[:, 1]
+})
+df_oof.to_csv(os.path.join(out_folder, "oof_predictions_residuals.csv"), index=False)
+
+# ============================================================
+# RESUMEN FINAL DE ARCHIVOS
+# ============================================================
+print("[3/3] Resumen de archivos generados...")
+
+print("\n✅ Proceso finalizado.")
+print(f"\n📁 Outputs guardados en: {out_folder}/")
+print(" - cv_metrics_by_fold.csv")
+print(" - cv_summary_mean_std.csv")
+print(" - rf_best_params_by_outer_fold.csv")
+print(" - nemenyi_RMSE.csv")
+print(" - nemenyi_MAE.csv")
+print(" - nemenyi_R2.csv")
+print(" - final_table_meanstd_letters.csv")
+print(" - variogram_experimental_SQIw.csv")
+print(" - variogram_experimental_OK_oof.csv")
+print(" - variogram_experimental_RF_oof.csv")
+print(" - variogram_experimental_RK_oof.csv")
+print(" - variogram_experimental_all_series.csv")
+print(" - variogram_experimental_4series.jpg")
+print(" - variogram_experimental_residuals_only.jpg")
+print(" - variogram_fit_table_OK_RK_oof.csv")
+print(" - oof_predictions_residuals.csv")
+```
+
+![Experimental variograms derived from cross-validation residuals.](paper_outputs_xy_optuna/variogram_experimental_4series.jpg)
+
+## Saving the Random Forest Model
+
+```{python}
+import os
+import joblib
+
+# ----------------------------
+# 1) Crear carpeta si no existe
+# ----------------------------
+save_dir = "saved_models"
+os.makedirs(save_dir, exist_ok=True)
+
+# ----------------------------
+# 2) Nombre del archivo
+# ----------------------------
+model_path = os.path.join(save_dir, "random_forest_model.joblib")
+
+# ----------------------------
+# 3) Guardar modelo
+# ----------------------------
+joblib.dump(rf, model_path)
+
+print(f"✅ Modelo Random Forest guardado en:")
+print(model_path)
+
+# ----------------------------
+# 4) Verificación rápida
+# ----------------------------
+if os.path.exists(model_path):
+    print("✔ Archivo creado correctamente")
+else:
+    print("❌ Error al guardar modelo")
+```
+
+<!--
+# PERMUTATION IMPORTANCE – RandomForest (RANDOM CV)
+> Carga el modelo RF guardado (joblib)
+> Usa los mismos splits Random CV (KFold shuffle=True)
+> Calcula importancia en el TEST de cada fold
+> Reporta mean ± std y grafica barras (Top N)
+-->
+
+# Permutation Importance of the Random Forest Model (Random Cross-Validation)
+
+## Project Setup
+```{python}
+import numpy as np
+import pandas as pd
+import joblib
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import KFold
+from sklearn.inspection import permutation_importance
+from sklearn.metrics import mean_squared_error
+from sklearn.base import clone
+```
+
+## General Computational Settings
+
+```{python}
+rf_model_path = "saved_models/random_forest_model.joblib"   # <- cambia al nombre real
+k_folds = 5
+random_seed = 42
+perm_repeats = 30
+TOP_N = 18
+```
+
+## Loading the Trained Model
+
+```{python}
+if "feature_names" not in globals():
+    # Si tu X = [predictor_names + coords], usa:
+    feature_names = predictor_names + ["Xcoord", "Ycoord"]
+    # Si NO incluyes coords, usa solo:
+    # feature_names = predictor_names
+```
+
+## Loading the Saved Model
+
+```{python}
+rf_saved = joblib.load(rf_model_path)
+print(f"✅ Modelo RF cargado: {rf_model_path}")
+print(f"Tipo: {type(rf_saved)}")
+```
+
+## Random Cross-Validation Using Identical Folds for All Models
+
+```{python}
+kf = KFold(n_splits=k_folds, shuffle=True, random_state=random_seed)
+splits = list(kf.split(X))
+```
+
+## RMSE Scoring Function (Negative RMSE for Optimization in Scikit-learn)
+
+```{python}
+def neg_rmse_scorer(estimator, X_eval, y_eval):
+    y_pred = estimator.predict(X_eval)
+    rmse = np.sqrt(mean_squared_error(y_eval, y_pred))
+    return -rmse
+```
+
+## Permutation Importance on the Test Set of Each Fold
+
+```{python}
+rows = []
+
+for fold_id, (train_idx, test_idx) in enumerate(splits, start=1):
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
+
+    # Clonamos para reentrenar por fold con el mismo set de hiperparámetros
+    model = clone(rf_saved)
+    model.fit(X_train, y_train)
+
+    r = permutation_importance(
+        model,
+        X_test, y_test,
+        scoring=neg_rmse_scorer,     # retorna -RMSE
+        n_repeats=perm_repeats,
+        random_state=random_seed,
+        n_jobs=-1
+    )
+
+    # Convertimos delta(-RMSE) -> incremento de RMSE
+    delta_rmse_mean = -r.importances_mean
+    delta_rmse_std  = r.importances_std
+
+    for j, fname in enumerate(feature_names):
+        rows.append([fold_id, fname, float(delta_rmse_mean[j]), float(delta_rmse_std[j])])
+
+df_imp = pd.DataFrame(rows, columns=["fold", "feature", "delta_RMSE_mean", "delta_RMSE_std"])
+
+summary = (
+    df_imp.groupby("feature")["delta_RMSE_mean"]
+    .agg(["mean", "std"])
+    .sort_values("mean", ascending=False)
+    .reset_index()
+)
+
+print("\n=== PERMUTATION IMPORTANCE – RandomForest (ΔRMSE) ===")
+print(summary.head(20).to_string(index=False))
+```
+
+## Bar Plot of the Top N Most Important Features
+
+```{python}
+plot_df = summary.head(TOP_N).copy()
+plot_df = plot_df.sort_values("mean", ascending=True)
+
+ypos = np.arange(len(plot_df))
+
+plt.figure()
+plt.barh(ypos, plot_df["mean"])
+plt.yticks(ypos, plot_df["feature"])
+plt.xlabel("Variación de RMSE al permutar la variable (ΔRMSE)")
+plt.title(f"Permutation Importance – RandomForest")
+plt.tight_layout()
+
+# Guardar imagen en alta resolución
+plt.savefig("permutation_importance_rf.jpg", dpi=600, bbox_inches="tight")
+
+plt.show()
+```
+
+![Permutation importance.](paper_outputs_xy_optuna/permutation_importance_rf.jpg)
+
+## Saving Results
+
+```{python}
+df_imp.to_csv(os.path.join(out_folder,"perm_importance_RF_randomCV_folds.csv"), index=False)
+summary.to_csv(os.path.join(out_folder,"perm_importance_RF_randomCV_summary.csv"), index=False)
+
+print("\n📌 Archivos generados:")
+print(" - perm_importance_RF_randomCV_folds.csv")
+print(" - perm_importance_RF_randomCV_summary.csv")
+```
+
+<!--
+# Random Forest reducido + Residual Kriging (RF+RK) + Optuna
+> Muestra métricas: RMSE, R2 y MAE
+> Guarda bundle para mapa: saved_models/RF_RK_reducido_FULL.joblib
+-->
+
+# Reduced Random Forest–Regression Kriging Model Optimized via Optuna under Random Cross-Validation
+
+## Project Setup
+
+```{python}
+import os
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import rasterio
+import optuna
+import joblib
+
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+from sklearn.ensemble import RandomForestRegressor
+
+from pykrige.ok import OrdinaryKriging
+```
+
+## General Computational Settings
+
+```{python}
+points_file = "JSON/soil_samples.geojson"
+covariables_folder = "Covariables"
+target_var = "SQIw"
+crs_target = 32717
+
+k_folds = 5
+random_seed = 42
+
+optuna_trials_rf = 60
+timeout_seconds = None
+
+variogram_model_ok = "spherical"
+
+selected_raster_predictors = [
+    "Precipitation",
+    "Elevation",
+    "Temperature",
+    "TRI"
+]
+
+feature_names = [
+    "Ycoord",
+    "Xcoord",
+    "Precipitation",
+    "Elevation",
+    "Temperature",
+    "TRI"
+]
+
+os.makedirs("saved_models", exist_ok=True)
+os.makedirs("paper_outputs_xy_optuna", exist_ok=True)
+save_full_model = True
+```
+
+## Utility Functions
+
+```{python}
+def extract_raster_values(raster_path, points_xy):
+    with rasterio.open(raster_path) as src:
+        vals = [v[0] for v in src.sample(points_xy)]
+    return np.asarray(vals, dtype="float64")
+
+def rmse(y_true, y_pred):
+    return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+
+def mae(y_true, y_pred):
+    return float(mean_absolute_error(y_true, y_pred))
+
+def fit_ok(coords_train, residuals_train, variogram_model="spherical"):
+    return OrdinaryKriging(
+        coords_train[:, 0],
+        coords_train[:, 1],
+        residuals_train,
+        variogram_model=variogram_model,
+        verbose=False,
+        enable_plotting=False
+    )
+
+def ok_predict_points(ok_model, coords_test):
+    z_pred, _ = ok_model.execute("points", coords_test[:, 0], coords_test[:, 1])
+    return np.asarray(z_pred).ravel()
+```
+
+## Data Loading: Sampling Points
+
+```{python}
+gdf = gpd.read_file(points_file)
+
+if gdf.crs is None:
+    gdf = gdf.set_crs(crs_target)
+else:
+    if gdf.crs.to_epsg() != crs_target:
+        gdf = gdf.to_crs(crs_target)
+
+if target_var not in gdf.columns:
+    raise ValueError(f"No se encontró '{target_var}' en el archivo de puntos.")
+
+coords = np.column_stack([gdf.geometry.x.values, gdf.geometry.y.values]).astype("float64")
+y = gdf[target_var].to_numpy(dtype="float64")
+```
+
+## Feature Matrix Construction (X)
+
+```{python}
+xcoord = coords[:, 0]
+ycoord = coords[:, 1]
+
+raster_data = {}
+for var in selected_raster_predictors:
+    raster_path = os.path.join(covariables_folder, f"{var}.tif")
+    if not os.path.exists(raster_path):
+        raise FileNotFoundError(f"Falta raster: {raster_path}")
+    raster_data[var] = extract_raster_values(raster_path, coords)
+
+# Orden explícito:
+# Ycoord, Xcoord, Precipitation, Elevation, Temperature, TRI
+X = np.column_stack([
+    ycoord,
+    xcoord,
+    raster_data["Precipitation"],
+    raster_data["Elevation"],
+    raster_data["Temperature"],
+    raster_data["TRI"]
+]).astype("float64")
+```
+
+## Data Cleaning: Handling Missing Values
+
+```{python}
+mask_valid = (~np.isnan(X).any(axis=1)) & (~np.isnan(y))
+X = X[mask_valid]
+y = y[mask_valid]
+coords = coords[mask_valid]
+
+print(f"✅ Puntos válidos: {len(y)}")
+print(f"✅ Variables usadas: {feature_names}")
+print(f"✅ Dimensión de X: {X.shape}")
+```
+
+## Random Cross-Validation Using Identical Folds
+
+```{python}
+kf = KFold(n_splits=k_folds, shuffle=True, random_state=random_seed)
+splits = list(kf.split(X))
+```
+
+## Hyperparameter Optimization Using Optuna (Random Cross-Validation)
+
+```{python}
+def eval_rf_rk_rmse(params):
+    rmses = []
+
+    for train_idx, test_idx in splits:
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+        coords_train, coords_test = coords[train_idx], coords[test_idx]
+
+        rf = RandomForestRegressor(
+            **params,
+            bootstrap=True,
+            random_state=random_seed,
+            n_jobs=-1
+        )
+        rf.fit(X_train, y_train)
+
+        pred_rf_test = rf.predict(X_test)
+
+        resid_train = y_train - rf.predict(X_train)
+        ok_model = fit_ok(coords_train, resid_train, variogram_model=variogram_model_ok)
+        krig_resid_test = ok_predict_points(ok_model, coords_test)
+
+        pred_final = pred_rf_test + krig_resid_test
+        rmses.append(rmse(y_test, pred_final))
+
+    return float(np.mean(rmses))
+
+def objective(trial):
+    params = {
+        "n_estimators": trial.suggest_int("n_estimators", 200, 2000, step=100),
+        "max_depth": trial.suggest_int("max_depth", 4, 40),
+        "min_samples_split": trial.suggest_int("min_samples_split", 2, 20),
+        "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 10),
+        "max_features": trial.suggest_categorical("max_features", ["sqrt", "log2", 0.5, 0.7, 1.0]),
+    }
+    return eval_rf_rk_rmse(params)
+
+print("\n🚀 Optuna optimizando Random Forest + RK...")
+study = optuna.create_study(
+    direction="minimize",
+    sampler=optuna.samplers.TPESampler(seed=random_seed)
+)
+study.optimize(objective, n_trials=optuna_trials_rf, timeout=timeout_seconds)
+
+best_params_rf = study.best_params
+print("\n=== MEJORES HIPERPARÁMETROS RF+RK ===")
+print("Best RMSE:", study.best_value)
+print("Best params:", best_params_rf)
+```
+
+## Final Model Evaluation
+
+```{python}
+rows = []
+pred_oof_rf = np.full_like(y, fill_value=np.nan, dtype="float64")
+pred_oof_rk = np.full_like(y, fill_value=np.nan, dtype="float64")
+resid_oof_rk = np.full_like(y, fill_value=np.nan, dtype="float64")
+
+for fold_id, (train_idx, test_idx) in enumerate(splits, start=1):
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
+    coords_train, coords_test = coords[train_idx], coords[test_idx]
+
+    rf = RandomForestRegressor(
+        **best_params_rf,
+        random_state=random_seed,
+        n_jobs=-1
+    )
+    rf.fit(X_train, y_train)
+
+    pred_rf = rf.predict(X_test)
+
+    resid_train = y_train - rf.predict(X_train)
+    ok_model = fit_ok(coords_train, resid_train, variogram_model=variogram_model_ok)
+    krig_resid_test = ok_predict_points(ok_model, coords_test)
+
+    pred_final = pred_rf + krig_resid_test
+
+    pred_oof_rf[test_idx] = pred_rf
+    pred_oof_rk[test_idx] = pred_final
+    resid_oof_rk[test_idx] = y_test - pred_final
+
+    fold_rmse = rmse(y_test, pred_final)
+    fold_r2 = float(r2_score(y_test, pred_final))
+    fold_mae = mae(y_test, pred_final)
+
+    rows.append([fold_id, fold_rmse, fold_r2, fold_mae])
+
+    print(f"Fold {fold_id}: RMSE={fold_rmse:.4f} | R2={fold_r2:.4f} | MAE={fold_mae:.4f}")
+
+df_cv = pd.DataFrame(rows, columns=["fold", "RMSE", "R2", "MAE"])
+
+print("\n=== Resumen (mean ± std) ===")
+print(df_cv.agg(["mean", "std"]))
+
+# Guardar métricas CV
+df_cv.to_csv("paper_outputs_xy_optuna/RF_reducido_RK_cv_metrics.csv", index=False)
+
+# Guardar predicciones OOF y residuales
+df_oof = pd.DataFrame({
+    "y_true": y,
+    "pred_RF": pred_oof_rf,
+    "pred_RF_RK": pred_oof_rk,
+    "resid_RF_RK": resid_oof_rk,
+    "Xcoord": coords[:, 0],
+    "Ycoord": coords[:, 1]
+})
+df_oof.to_csv("paper_outputs_xy_optuna/RF_reducido_RK_oof_predictions.csv", index=False)
+```
+
+## Full Dataset Training and Model Saving
+
+```{python}
+if save_full_model:
+    rf_full = RandomForestRegressor(
+        **best_params_rf,
+        random_state=random_seed,
+        n_jobs=-1
+    )
+    rf_full.fit(X, y)
+
+    residuals_full = y - rf_full.predict(X)
+
+    bundle = {
+        "rf_model": rf_full,
+        "coords_train": coords,
+        "residuals_train": residuals_full,
+        "variogram_model": variogram_model_ok,
+        "feature_names": feature_names,
+        "selected_raster_predictors": selected_raster_predictors,
+        "target_var": target_var,
+        "crs_epsg": crs_target
+    }
+
+    out_path = "saved_models/random_forest_reducido_rk.joblib"
+    joblib.dump(bundle, out_path)
+
+    print("\n✅ Modelo guardado en:", out_path)
+    print("✅ Métricas CV guardadas en: paper_outputs_xy_optuna/RF_reducido_RK_cv_metrics.csv")
+    print("✅ Predicciones OOF guardadas en: paper_outputs_xy_optuna/RF_reducido_RK_oof_predictions.csv")
+```
+
+
+# Spatial Prediction via Random Forest and Residual Kriging (RK)
+
+<!-- GENERAR RASTER: Random Forest + Residual Kriging (RK)
+> (robusto contra errores 1D/2D en coords) 
+-->
+
+## Project Setup
+
+```{python}
+import os
+import joblib
+import numpy as np
+import rasterio
+from rasterio.windows import Window
+from pykrige.ok import OrdinaryKriging
+```
+
+## General Computational Settings
+
+```{python}
+models_folder = "saved_models"
+model_filename = "random_forest_reducido_rk.joblib"
+model_path = os.path.join(models_folder, model_filename)
+
+covariables_folder = "Covariables"
+template_raster = os.path.join(covariables_folder, "Precipitation.tif")
+
+out_pred_raster      = "Covariables/SQIw_RF_RK_prediction.tif"
+out_rf_std_raster    = "Covariables/SQIw_RF_RK_uncertainty_rf_std.tif"
+out_rk_std_raster    = "Covariables/SQIw_RF_RK_uncertainty_rk_std.tif"
+out_total_std_raster = "Covariables/SQIw_RF_RK_uncertainty_total_std.tif"
+out_total_cv_raster  = "Covariables/SQIw_RF_RK_uncertainty_total_cv.tif"
+
+window_size = 512
+krige_chunk = 50000
+use_float32 = True
+
+default_raster_predictors = [
+    "Precipitation",
+    "Elevation",
+    "Temperature",
+    "TRI"
+]
+```
+
+## Loading the Saved Model Bundle
+
+```{python}
+bundle = joblib.load(model_path)
+
+def pick_key(d, candidates):
+    for k in candidates:
+        if k in d:
+            return k
+    return None
+
+if not isinstance(bundle, dict):
+    raise ValueError("Se esperaba un joblib tipo dict.")
+
+k_rf   = pick_key(bundle, ["rf_model", "model_rf", "rf", "RandomForest"])
+k_xy   = pick_key(bundle, ["coords_train", "xy_train", "train_coords", "coords"])
+k_res  = pick_key(bundle, ["residuals_train", "resid_train", "residuals", "rk_residuals"])
+k_var  = pick_key(bundle, ["variogram_model", "variogram", "variogram_model_ok"])
+k_feat = pick_key(bundle, ["feature_names", "features", "model_features"])
+k_pred = pick_key(bundle, ["selected_raster_predictors", "predictor_names", "predictors", "covariate_names"])
+k_crs  = pick_key(bundle, ["crs_epsg", "crs_target", "epsg"])
+
+if k_rf is None:
+    raise ValueError("El joblib no contiene 'rf_model'.")
+if k_xy is None:
+    raise ValueError("El joblib no contiene 'coords_train'.")
+if k_res is None:
+    raise ValueError("El joblib no contiene 'residuals_train'.")
+if k_feat is None:
+    raise ValueError("El joblib no contiene 'feature_names'.")
+
+rf_model = bundle[k_rf]
+coords_train = np.asarray(bundle[k_xy], dtype="float64")
+residuals_train = np.asarray(bundle[k_res], dtype="float64")
+variogram_model = bundle[k_var] if k_var is not None else "spherical"
+feature_names = list(bundle[k_feat])
+raster_predictors = list(bundle[k_pred]) if k_pred is not None else default_raster_predictors
+model_crs_epsg = bundle[k_crs] if k_crs is not None else None
+
+if not hasattr(rf_model, "estimators_"):
+    raise ValueError("El modelo cargado no parece ser un RandomForestRegressor entrenado.")
+
+# Reconstruir kriging de residuales
+ok_resid = OrdinaryKriging(
+    coords_train[:, 0],
+    coords_train[:, 1],
+    residuals_train,
+    variogram_model=variogram_model,
+    verbose=False,
+    enable_plotting=False
+)
+
+print("✅ Modelo RF cargado")
+print("✅ feature_names:", feature_names)
+print("✅ raster predictors:", raster_predictors)
+print("✅ n_estimators:", len(rf_model.estimators_))
+print("✅ Variogram model:", variogram_model)
+```
+
+## Loading the Template Raster and Covariates
+
+```{python}
+with rasterio.open(template_raster) as tmpl:
+    profile = tmpl.profile.copy()
+    profile.update(
+        dtype="float32" if use_float32 else "float64",
+        count=1,
+        compress="lzw",
+        nodata=np.nan
+    )
+
+    width, height = tmpl.width, tmpl.height
+    transform = tmpl.transform
+    crs = tmpl.crs
+
+    print(f"✅ Template: {width} x {height} | CRS={crs}")
+
+    if model_crs_epsg is not None:
+        tmpl_epsg = crs.to_epsg() if crs is not None else None
+        if tmpl_epsg != model_crs_epsg:
+            raise ValueError(
+                f"❌ El CRS del template ({tmpl_epsg}) no coincide con el del modelo ({model_crs_epsg})."
+            )
+
+    cov_srcs = {}
+    for name in raster_predictors:
+        p = os.path.join(covariables_folder, f"{name}.tif")
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"Falta raster covariable: {p}")
+        cov_srcs[name] = rasterio.open(p)
+
+    for name, src in cov_srcs.items():
+        if (src.width != width) or (src.height != height) or (src.crs != crs) or (src.transform != transform):
+            raise ValueError(
+                f"❌ Raster no alineado: {name}\n"
+                f"   size {src.width}x{src.height} vs template {width}x{height}\n"
+                f"   crs {src.crs} vs {crs}\n"
+                f"   transform {src.transform} vs {transform}\n"
+                "Reproyecta/resamplea covariables para que coincidan exactamente."
+            )
+```
+
+## Writing the Predicted Raster Output
+
+```{python}
+with rasterio.open(out_pred_raster, "w", **profile) as dst_pred, \
+         rasterio.open(out_rf_std_raster, "w", **profile) as dst_rf_std, \
+         rasterio.open(out_rk_std_raster, "w", **profile) as dst_rk_std, \
+         rasterio.open(out_total_std_raster, "w", **profile) as dst_total_std, \
+         rasterio.open(out_total_cv_raster, "w", **profile) as dst_total_cv:
+
+        for row0 in range(0, height, window_size):
+            h = min(window_size, height - row0)
+            rows = row0 + np.arange(h)
+
+            for col0 in range(0, width, window_size):
+                w = min(window_size, width - col0)
+                cols = col0 + np.arange(w)
+                win = Window(col0, row0, w, h)
+
+                # ----------------------------------------
+                # 3.1 Leer covariables y máscara válida
+                # ----------------------------------------
+                raster_block = {}
+                valid_mask = np.ones((h, w), dtype=bool)
+
+                for name in raster_predictors:
+                    a = cov_srcs[name].read(1, window=win, masked=True)
+                    mask = np.ma.getmaskarray(a)
+                    data = np.asarray(a.filled(np.nan), dtype="float64")
+
+                    valid_mask &= (~mask) & np.isfinite(data)
+                    raster_block[name] = data
+
+                pred_block = np.full((h, w), np.nan, dtype="float64")
+                rf_std_block = np.full((h, w), np.nan, dtype="float64")
+                rk_std_block = np.full((h, w), np.nan, dtype="float64")
+                total_std_block = np.full((h, w), np.nan, dtype="float64")
+                total_cv_block = np.full((h, w), np.nan, dtype="float64")
+
+                if not np.any(valid_mask):
+                    dst_pred.write(pred_block.astype(profile["dtype"]), 1, window=win)
+                    dst_rf_std.write(rf_std_block.astype(profile["dtype"]), 1, window=win)
+                    dst_rk_std.write(rk_std_block.astype(profile["dtype"]), 1, window=win)
+                    dst_total_std.write(total_std_block.astype(profile["dtype"]), 1, window=win)
+                    dst_total_cv.write(total_cv_block.astype(profile["dtype"]), 1, window=win)
+                    continue
+
+                # ----------------------------------------
+                # 3.2 Coordenadas centro de pixel
+                # ----------------------------------------
+                cc, rr = np.meshgrid(cols, rows)
+
+                xs = transform.c + (cc + 0.5) * transform.a + (rr + 0.5) * transform.b
+                ys = transform.f + (cc + 0.5) * transform.d + (rr + 0.5) * transform.e
+
+                xs = xs.astype("float64")
+                ys = ys.astype("float64")
+
+                # ----------------------------------------
+                # 3.3 Construir X en el orden exacto del modelo
+                # ----------------------------------------
+                n_valid = int(valid_mask.sum())
+                X_feat = np.empty((n_valid, len(feature_names)), dtype="float64")
+
+                for j, feat in enumerate(feature_names):
+                    if feat == "Xcoord":
+                        X_feat[:, j] = xs[valid_mask]
+                    elif feat == "Ycoord":
+                        X_feat[:, j] = ys[valid_mask]
+                    elif feat in raster_block:
+                        X_feat[:, j] = raster_block[feat][valid_mask]
+                    else:
+                        raise ValueError(
+                            f"La feature '{feat}' no corresponde ni a coordenadas ni a un raster disponible."
+                        )
+
+                # ----------------------------------------
+                # 3.4 Incertidumbre RF
+                # ----------------------------------------
+                tree_preds = np.column_stack([
+                    est.predict(X_feat) for est in rf_model.estimators_
+                ])
+
+                pred_rf_mean = np.mean(tree_preds, axis=1)
+                pred_rf_std = np.std(tree_preds, axis=1, ddof=1)
+                pred_rf_var = pred_rf_std ** 2
+
+                # ----------------------------------------
+                # 3.5 Kriging de residuales + varianza de kriging
+                # ----------------------------------------
+                xv = xs[valid_mask].ravel()
+                yv = ys[valid_mask].ravel()
+
+                krig_mean = np.empty_like(xv, dtype="float64")
+                krig_var = np.empty_like(xv, dtype="float64")
+
+                start = 0
+                while start < len(xv):
+                    end = min(start + krige_chunk, len(xv))
+                    z_pred, z_var = ok_resid.execute("points", xv[start:end], yv[start:end])
+                    krig_mean[start:end] = np.asarray(z_pred).ravel()
+                    krig_var[start:end] = np.asarray(z_var).ravel()
+                    start = end
+
+                krig_var = np.maximum(krig_var, 0.0)
+                krig_std = np.sqrt(krig_var)
+
+                # ----------------------------------------
+                # 3.6 Combinar predicción e incertidumbre
+                # ----------------------------------------
+                pred_final = pred_rf_mean + krig_mean
+
+                total_var = pred_rf_var + krig_var
+                total_var = np.maximum(total_var, 0.0)
+                total_std = np.sqrt(total_var)
+
+                total_cv = np.full_like(total_std, np.nan, dtype="float64")
+                nonzero = np.abs(pred_final) > 1e-12
+                total_cv[nonzero] = 100.0 * total_std[nonzero] / np.abs(pred_final[nonzero])
+
+                # ----------------------------------------
+                # 3.7 Reconstruir bloques
+                # ----------------------------------------
+                pred_block[valid_mask] = pred_final
+                rf_std_block[valid_mask] = pred_rf_std
+                rk_std_block[valid_mask] = krig_std
+                total_std_block[valid_mask] = total_std
+                total_cv_block[valid_mask] = total_cv
+
+                dst_pred.write(pred_block.astype(profile["dtype"]), 1, window=win)
+                dst_rf_std.write(rf_std_block.astype(profile["dtype"]), 1, window=win)
+                dst_rk_std.write(rk_std_block.astype(profile["dtype"]), 1, window=win)
+                dst_total_std.write(total_std_block.astype(profile["dtype"]), 1, window=win)
+                dst_total_cv.write(total_cv_block.astype(profile["dtype"]), 1, window=win)
+
+            print(f"Procesado filas {row0}–{row0+h-1} / {height-1}")
+
+for src in cov_srcs.values():
+        src.close()
+
+print("\n✅ Rasters generados:")
+print(" -", out_pred_raster)
+print(" -", out_rf_std_raster)
+print(" -", out_rk_std_raster)
+print(" -", out_total_std_raster)
+print(" -", out_total_cv_raster)
+```
+
+## Visualization of Spatial Prediction Results
+
+```{python}
+import rasterio
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ----------------------------
+# ARCHIVO
+# ----------------------------
+raster_file = "Covariables/SQIw_RF_RK_prediction.tif"
+
+# ----------------------------
+# LEER RASTER
+# ----------------------------
+with rasterio.open(raster_file) as src:
+    data = src.read(1)
+    nodata = src.nodata
+
+# convertir nodata a nan
+if nodata is not None:
+    data = np.where(data == nodata, np.nan, data)
+
+print("Min:", np.nanmin(data))
+print("Max:", np.nanmax(data))
+
+# ----------------------------
+# GRAFICAR
+# ----------------------------
+plt.figure(figsize=(10,8))
+
+img = plt.imshow(
+    data,
+    cmap="viridis",
+    vmin=np.nanpercentile(data,2),
+    vmax=np.nanpercentile(data,98)
+)
+
+plt.colorbar(img, label="SQIw")
+plt.title("SQIw (Random Forest) prediction map")
+plt.axis("off")
+
+plt.show()
+```
+
+```{python}
+plt.savefig("paper_outputs_xy_optuna/SQIw_prediction_map.png", dpi=600, bbox_inches="tight")
+plt.close()
+```
+
+![SQIw Prediction.](paper_outputs_xy_optuna/SQIw_prediction_map.png)
+
+## Visualization of Uncertainty Results
+
+```{python}
+import rasterio
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ----------------------------
+# ARCHIVO
+# ----------------------------
+raster_file = "Covariables/SQIw_RF_RK_uncertainty_total_std.tif"
+
+# ----------------------------
+# LEER RASTER
+# ----------------------------
+with rasterio.open(raster_file) as src:
+    data = src.read(1)
+    nodata = src.nodata
+
+# convertir nodata a nan
+if nodata is not None:
+    data = np.where(data == nodata, np.nan, data)
+
+print("Min:", np.nanmin(data))
+print("Max:", np.nanmax(data))
+
+# ----------------------------
+# GRAFICAR
+# ----------------------------
+plt.figure(figsize=(10,8))
+
+img = plt.imshow(
+    data,
+    cmap="viridis",
+    vmin=np.nanpercentile(data,2),
+    vmax=np.nanpercentile(data,98)
+)
+
+plt.colorbar(img, label="SQIw")
+plt.title("SQIw uncertainty map (standard deviation)")
+plt.axis("off")
+
+plt.show()
+```
+
+```{python}
+plt.savefig("paper_outputs_xy_optuna/SQIw_uncertainty_map.png", dpi=600, bbox_inches="tight")
+plt.close()
+```
+
+![SQIw Uncertainty.](paper_outputs_xy_optuna/SQIw_uncertainty_map.png)
