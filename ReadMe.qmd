@@ -1,6 +1,8 @@
-**Variación espacial del índice de fertilidad del suelo y recomendaciones de fertilización en los cultivos de Mango y Banano en agroecosistemas de la costa norte árida peruana**
+**Hybrid machine learning–geostatistical modelling of soil quality in saline, sodic and alkaline soils under arid agroecosystems
+**
 
-Sebastian Casas-Niño;
+Sebastian Casas-Niño, Gerson La Rosa Lama, Sharon Mejia, Ruth Mercado, Kenyi Quispe*
+
 
 ---
 
