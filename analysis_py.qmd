@@ -62,8 +62,8 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 ## General Computational Settings
 
 ```{python}
-points_file = "JSON/soil_samples.geojson"
-covariables_folder = "Covariables"
+points_file = "gis/JSON/soil_samples.geojson"
+covariables_folder = "gis/Covariables"
 target_var = "SQIw"
 crs_target = 32717
 
@@ -100,14 +100,68 @@ os.makedirs(out_folder, exist_ok=True)
 ## Utility Functions
 
 ```{python}
+from sklearn.metrics import (
+    mean_squared_error,
+    mean_absolute_error,
+    r2_score
+)
+
 def rmse_func(y_true, y_pred):
     return float(np.sqrt(mean_squared_error(y_true, y_pred)))
 
+def ccc_lin(y_true, y_pred):
+
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+
+    mean_true = np.mean(y_true)
+    mean_pred = np.mean(y_pred)
+
+    var_true = np.var(y_true, ddof=1)
+    var_pred = np.var(y_pred, ddof=1)
+
+    cov = np.cov(y_true, y_pred, ddof=1)[0, 1]
+
+    denom = var_true + var_pred + (mean_true - mean_pred) ** 2
+
+    if denom == 0:
+        return np.nan
+
+    return float((2 * cov) / denom)
+
 def metrics(y_true, y_pred):
-    rmse = rmse_func(y_true, y_pred)
+
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+
+    rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
     mae = float(mean_absolute_error(y_true, y_pred))
     r2 = float(r2_score(y_true, y_pred))
-    return rmse, mae, r2
+
+    mean_y = np.mean(y_true)
+    nrmse = float((rmse / mean_y) * 100) if mean_y != 0 else np.nan
+
+    mask = y_true != 0
+    rel_error = (
+        float(np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100)
+        if np.sum(mask) > 0 else np.nan
+    )
+
+    bias = float(np.mean(y_pred - y_true))
+
+    ccc = ccc_lin(y_true, y_pred)
+
+    return {
+        "RMSE": rmse,
+        "MAE": mae,
+        "R2": r2,
+        "nRMSE_%": nrmse,
+        "RelError_%": rel_error,
+        "Bias": bias,
+        "CCC": ccc
+    }
+
+
 
 def extract_raster_values(raster_path, points_xy):
     with rasterio.open(raster_path) as src:
@@ -200,7 +254,6 @@ def vario_exponential(h, nugget, psill, rang):
 def vario_gaussian(h, nugget, psill, rang):
     h = np.asarray(h, dtype="float64")
     return nugget + psill * (1.0 - np.exp(-(h / rang) ** 2))
-
 ```
 
 ## Data Loading: Sampling Points
@@ -385,8 +438,19 @@ for fold_id, (train_idx, test_idx) in enumerate(splits, start=1):
     pred_oof_ok[test_idx] = pred_ok
     resid_oof_ok[test_idx] = y_test - pred_ok
 
-    rmse_ok, mae_ok, r2_ok = metrics(y_test, pred_ok)
-    rows.append([fold_id, "OrdinaryKriging", rmse_ok, mae_ok, r2_ok, vm_ok])
+    m_ok = metrics(y_test, pred_ok)
+
+    rows.append([
+        fold_id,
+        "OrdinaryKriging",
+        m_ok["RMSE"],
+        m_ok["MAE"],
+        m_ok["R2"],
+        m_ok["nRMSE_%"],
+        m_ok["RelError_%"],
+        m_ok["CCC"],
+        vm_ok
+    ])
 
     # --------------------------------------------------------
     # (2) RF con mejores hiperparámetros globales de Optuna
@@ -398,8 +462,19 @@ for fold_id, (train_idx, test_idx) in enumerate(splits, start=1):
     pred_oof_rf[test_idx] = pred_rf
     resid_oof_rf[test_idx] = y_test - pred_rf
 
-    rmse_rf, mae_rf, r2_rf = metrics(y_test, pred_rf)
-    rows.append([fold_id, "RandomForest_XY", rmse_rf, mae_rf, r2_rf, "NA"])
+    m_rf = metrics(y_test, pred_rf)
+
+    rows.append([
+        fold_id,
+        "RandomForest_XY",
+        m_rf["RMSE"],
+        m_rf["MAE"],
+        m_rf["R2"],
+        m_rf["nRMSE_%"],
+        m_rf["RelError_%"],
+        m_rf["CCC"],
+        "NA"
+    ])
 
     # --------------------------------------------------------
     # (3) RF + RK
@@ -419,16 +494,42 @@ for fold_id, (train_idx, test_idx) in enumerate(splits, start=1):
     pred_oof_rk[test_idx] = pred_rf_rk
     resid_oof_rk[test_idx] = y_test - pred_rf_rk
 
-    rmse_rk, mae_rk, r2_rk = metrics(y_test, pred_rf_rk)
-    rows.append([fold_id, "RandomForest_XY+RK", rmse_rk, mae_rk, r2_rk, vm_rk])
+    m_rk = metrics(y_test, pred_rf_rk)
+
+    rows.append([
+        fold_id,
+        "RandomForest_XY+RK",
+        m_rk["RMSE"],
+        m_rk["MAE"],
+        m_rk["R2"],
+        m_rk["nRMSE_%"],
+        m_rk["RelError_%"],
+        m_rk["CCC"],
+        vm_rk
+    ])
 
 # ------------------------------------------------------------
 #  Guardar métricas por fold
 # ------------------------------------------------------------
+
 df_folds = pd.DataFrame(
     rows,
-    columns=["fold", "model", "RMSE", "MAE", "R2", "variogram_used"]
+    columns=[
+        "fold",
+        "model",
+        "RMSE",
+        "MAE",
+        "R2",
+        "nRMSE_%",
+        "RelError_%",
+        "CCC",
+        "variogram_used"
+    ]
 )
+
+print("\n=== CV métricas por fold ===")
+display(df_folds)
+
 df_folds.to_csv(os.path.join(out_folder, "cv_metrics_by_fold.csv"), index=False)
 
 # Guardar mejores hiperparámetros globales de RF
@@ -438,25 +539,56 @@ df_best_params.to_csv(os.path.join(out_folder, "rf_best_params_randomcv.csv"), i
 print("\n=== CV métricas por fold ===")
 print(df_folds.head(12))
 
-summary = df_folds.groupby("model")[["RMSE", "MAE", "R2"]].agg(["mean", "std"])
-summary.to_csv(os.path.join(out_folder, "cv_summary_mean_std.csv"))
+df_summary = (
+    df_folds
+    .groupby("model")
+    .agg({
+        "RMSE": ["mean", "std"],
+        "MAE": ["mean", "std"],
+        "R2": ["mean", "std"],
+        "nRMSE_%": ["mean", "std"],
+        "RelError_%": ["mean", "std"],
+        "CCC": ["mean", "std"]
+    })
+    .round(4)
+)
 
 print("\n=== Resumen mean ± std ===")
-print(summary)
+display(df_summary)
 ```
 
 ## Model Comparison Using Friedman and Nemenyi Tests with Compact Letter Display (CLD)
 
 ```{python}
-print("\n Ejecutando Friedman + Nemenyi + letras...")
+print("\nEjecutando Friedman + Nemenyi + letras...")
+
+metrics_info = {
+    "RMSE": False,
+    "MAE": False,
+    "R2": True,
+    "nRMSE_%": False,
+    "RelError_%": False,
+    "CCC": True
+}
+
+metrics = list(metrics_info.keys())
 
 models = ["OrdinaryKriging", "RandomForest_XY", "RandomForest_XY+RK"]
 
+summary = df_folds.groupby("model")[metrics].agg(["mean", "std"])
+
 def metric_pivot(df, metric, model_order):
-    pv = df.pivot_table(index="fold", columns="model", values=metric, aggfunc="mean")
+    pv = df.pivot_table(
+        index="fold",
+        columns="model",
+        values=metric,
+        aggfunc="mean"
+    )
     pv = pv.loc[:, model_order]
+
     if pv.isna().any().any():
         raise ValueError(f"Hay NaNs en el pivot de {metric}.")
+
     return pv
 
 def friedman_test_from_pivot(pivot_df):
@@ -470,19 +602,25 @@ def nemenyi_from_pivot(pivot_df):
     return pvals
 
 def cld_letters_from_pvals(pvals, means, alpha=0.05, higher_is_better=False):
-    order = means.sort_values(ascending=not higher_is_better).index.tolist()
+    order = means.sort_values(
+        ascending=not higher_is_better
+    ).index.tolist()
+
     letters = {m: "" for m in order}
     groups = []
     alphabet = "abcdefghijklmnopqrstuvwxyz"
 
     for m in order:
         placed = False
+
         for g in groups:
             ok_group = True
+
             for other in g["members"]:
                 if pvals.loc[m, other] < alpha:
                     ok_group = False
                     break
+
             if ok_group:
                 letters[m] += g["letter"]
                 g["members"].append(m)
@@ -491,19 +629,29 @@ def cld_letters_from_pvals(pvals, means, alpha=0.05, higher_is_better=False):
 
         if not placed:
             letter = alphabet[len(groups)]
-            groups.append({"letter": letter, "members": [m]})
+            groups.append({
+                "letter": letter,
+                "members": [m]
+            })
             letters[m] += letter
 
     return letters
 
 results_stats = {}
 
-for metric, higher_is_better in [("RMSE", False), ("MAE", False), ("R2", True)]:
+for metric, higher_is_better in metrics_info.items():
+
     pv = metric_pivot(df_folds, metric, models)
     p_f = friedman_test_from_pivot(pv)
     pvals = nemenyi_from_pivot(pv)
     means = pv.mean(axis=0)
-    letters = cld_letters_from_pvals(pvals, means, alpha=alpha, higher_is_better=higher_is_better)
+
+    letters = cld_letters_from_pvals(
+        pvals,
+        means,
+        alpha=alpha,
+        higher_is_better=higher_is_better
+    )
 
     results_stats[metric] = {
         "friedman_p": p_f,
@@ -517,27 +665,36 @@ for metric, higher_is_better in [("RMSE", False), ("MAE", False), ("R2", True)]:
     print("Medias:")
     print(means.sort_values(ascending=not higher_is_better))
     print("Letras:")
-    for m in means.sort_values(ascending=not higher_is_better).index:
-        print(f"  {m:20s} -> ({letters[m]})")
 
-    pvals.to_csv(os.path.join(out_folder, f"nemenyi_{metric}.csv"))
+    for model_name in means.sort_values(ascending=not higher_is_better).index:
+        print(f"  {model_name:20s} -> ({letters[model_name]})")
+
+    pvals.to_csv(
+        os.path.join(out_folder, f"nemenyi_{metric}.csv")
+    )
 
 def format_mean_std_letter(model, metric):
-    m = summary.loc[model, (metric, "mean")]
-    s = summary.loc[model, (metric, "std")]
+    mean_value = summary.loc[model, (metric, "mean")]
+    std_value = summary.loc[model, (metric, "std")]
     letter = results_stats[metric]["letters"][model]
-    return f"{m:.4f} ± {s:.4f} ({letter})"
 
-final_table = pd.DataFrame(index=models, columns=["RMSE", "MAE", "R2"])
-for m in models:
-    final_table.loc[m, "RMSE"] = format_mean_std_letter(m, "RMSE")
-    final_table.loc[m, "MAE"] = format_mean_std_letter(m, "MAE")
-    final_table.loc[m, "R2"] = format_mean_std_letter(m, "R2")
+    return f"{mean_value:.4f} ± {std_value:.4f} ({letter})"
 
-final_table.to_csv(os.path.join(out_folder, "final_table_meanstd_letters.csv"))
+final_table = pd.DataFrame(index=models, columns=metrics)
 
-print("\n=== Tabla final ===")
-final_table
+for model_name in models:
+    for metric in metrics:
+        final_table.loc[model_name, metric] = format_mean_std_letter(
+            model_name,
+            metric
+        )
+
+final_table.to_csv(
+    os.path.join(out_folder, "final_table_meanstd_letters.csv")
+)
+
+print("\n=== Tabla final: mean ± sd with CLD ===")
+display(final_table)
 ```
 
 ```{python}
@@ -1002,8 +1159,8 @@ from pykrige.ok import OrdinaryKriging
 ## General Computational Settings
 
 ```{python}
-points_file = "JSON/soil_samples.geojson"
-covariables_folder = "Covariables"
+points_file = "gis/JSON/soil_samples.geojson"
+covariables_folder = "gis/Covariables"
 target_var = "SQIw"
 crs_target = 32717
 
@@ -1044,13 +1201,55 @@ def extract_raster_values(raster_path, points_xy):
         vals = [v[0] for v in src.sample(points_xy)]
     return np.asarray(vals, dtype="float64")
 
+# ------------------------------------------------------------
+# Error metrics
+# ------------------------------------------------------------
+
 def rmse(y_true, y_pred):
     return float(np.sqrt(mean_squared_error(y_true, y_pred)))
 
 def mae(y_true, y_pred):
     return float(mean_absolute_error(y_true, y_pred))
 
-def fit_ok(coords_train, residuals_train, variogram_model="spherical"):
+def r2(y_true, y_pred):
+    return float(r2_score(y_true, y_pred))
+
+def nrmse(y_true, y_pred):
+    """
+    Normalized RMSE (%)
+    Normalized by mean observed value
+    """
+    return (
+        np.sqrt(mean_squared_error(y_true, y_pred))
+        / np.mean(y_true)
+        * 100
+    )
+
+def relative_error(y_true, y_pred):
+    """
+    Mean Relative Error (%)
+    """
+    return np.mean(
+        np.abs((y_true - y_pred) / y_true)
+    ) * 100
+
+def cc(y_true, y_pred):
+    """
+    Pearson Correlation Coefficient
+    """
+    return float(
+        np.corrcoef(y_true, y_pred)[0, 1]
+    )
+
+# ------------------------------------------------------------
+# Kriging functions
+# ------------------------------------------------------------
+
+def fit_ok(
+    coords_train,
+    residuals_train,
+    variogram_model="spherical"
+):
     return OrdinaryKriging(
         coords_train[:, 0],
         coords_train[:, 1],
@@ -1061,7 +1260,12 @@ def fit_ok(coords_train, residuals_train, variogram_model="spherical"):
     )
 
 def ok_predict_points(ok_model, coords_test):
-    z_pred, _ = ok_model.execute("points", coords_test[:, 0], coords_test[:, 1])
+    z_pred, _ = ok_model.execute(
+        "points",
+        coords_test[:, 0],
+        coords_test[:, 1]
+    )
+
     return np.asarray(z_pred).ravel()
 ```
 
@@ -1185,51 +1389,125 @@ print("Best params:", best_params_rf)
 
 ```{python}
 rows = []
+
 pred_oof_rf = np.full_like(y, fill_value=np.nan, dtype="float64")
 pred_oof_rk = np.full_like(y, fill_value=np.nan, dtype="float64")
 resid_oof_rk = np.full_like(y, fill_value=np.nan, dtype="float64")
 
 for fold_id, (train_idx, test_idx) in enumerate(splits, start=1):
+
     X_train, X_test = X[train_idx], X[test_idx]
     y_train, y_test = y[train_idx], y[test_idx]
+
     coords_train, coords_test = coords[train_idx], coords[test_idx]
 
+    # RF
     rf = RandomForestRegressor(
         **best_params_rf,
         random_state=random_seed,
         n_jobs=-1
     )
+
     rf.fit(X_train, y_train)
 
     pred_rf = rf.predict(X_test)
 
+    # RK
     resid_train = y_train - rf.predict(X_train)
-    ok_model = fit_ok(coords_train, resid_train, variogram_model=variogram_model_ok)
-    krig_resid_test = ok_predict_points(ok_model, coords_test)
+
+    ok_model = fit_ok(
+        coords_train,
+        resid_train,
+        variogram_model=variogram_model_ok
+    )
+
+    krig_resid_test = ok_predict_points(
+        ok_model,
+        coords_test
+    )
 
     pred_final = pred_rf + krig_resid_test
 
+    # OOF
     pred_oof_rf[test_idx] = pred_rf
     pred_oof_rk[test_idx] = pred_final
     resid_oof_rk[test_idx] = y_test - pred_final
 
+    # Métricas
     fold_rmse = rmse(y_test, pred_final)
-    fold_r2 = float(r2_score(y_test, pred_final))
     fold_mae = mae(y_test, pred_final)
+    fold_r2 = r2_score(y_test, pred_final)
 
-    rows.append([fold_id, fold_rmse, fold_r2, fold_mae])
+    fold_nrmse = (
+        fold_rmse / np.mean(y_test)
+    ) * 100
 
-    print(f"Fold {fold_id}: RMSE={fold_rmse:.4f} | R2={fold_r2:.4f} | MAE={fold_mae:.4f}")
+    fold_relerror = (
+    fold_mae / np.mean(y_test)
+    ) * 100
 
-df_cv = pd.DataFrame(rows, columns=["fold", "RMSE", "R2", "MAE"])
+    fold_cc = np.corrcoef(
+        y_test,
+        pred_final
+    )[0, 1]
+
+    rows.append([
+        fold_id,
+        fold_rmse,
+        fold_mae,
+        fold_r2,
+        fold_nrmse,
+        fold_relerror,
+        fold_cc
+    ])
+
+    print(
+        f"Fold {fold_id}: "
+        f"RMSE={fold_rmse:.4f} | "
+        f"MAE={fold_mae:.4f} | "
+        f"R2={fold_r2:.4f} | "
+        f"nRMSE={fold_nrmse:.2f}% | "
+        f"RelError={fold_relerror:.2f}% | "
+        f"CC={fold_cc:.4f}"
+    )
+
+# ------------------------------------------------------------
+# Tabla CV
+# ------------------------------------------------------------
+
+df_cv = pd.DataFrame(
+    rows,
+    columns=[
+        "fold",
+        "RMSE",
+        "MAE",
+        "R2",
+        "nRMSE_%",
+        "RelError_%",
+        "CC"
+    ]
+)
 
 print("\n=== Resumen (mean ± std) ===")
-print(df_cv.agg(["mean", "std"]))
+print(
+    df_cv.drop(columns=["fold"])
+         .agg(["mean", "std"])
+         .T
+)
 
-# Guardar métricas CV
-df_cv.to_csv("paper_outputs_xy_optuna/RF_reducido_RK_cv_metrics.csv", index=False)
+# ------------------------------------------------------------
+# Guardar métricas
+# ------------------------------------------------------------
 
-# Guardar predicciones OOF y residuales
+df_cv.to_csv(
+    "paper_outputs_xy_optuna/RF_reducido_RK_cv_metrics.csv",
+    index=False
+)
+
+# ------------------------------------------------------------
+# Predicciones OOF
+# ------------------------------------------------------------
+
 df_oof = pd.DataFrame({
     "y_true": y,
     "pred_RF": pred_oof_rf,
@@ -1238,7 +1516,11 @@ df_oof = pd.DataFrame({
     "Xcoord": coords[:, 0],
     "Ycoord": coords[:, 1]
 })
-df_oof.to_csv("paper_outputs_xy_optuna/RF_reducido_RK_oof_predictions.csv", index=False)
+
+df_oof.to_csv(
+    "paper_outputs_xy_optuna/RF_reducido_RK_oof_predictions.csv",
+    index=False
+)
 ```
 
 ## Full Dataset Training and Model Saving
@@ -1298,14 +1580,14 @@ models_folder = "saved_models"
 model_filename = "random_forest_reducido_rk.joblib"
 model_path = os.path.join(models_folder, model_filename)
 
-covariables_folder = "Covariables"
+covariables_folder = "gis/Covariables"
 template_raster = os.path.join(covariables_folder, "Precipitation.tif")
 
-out_pred_raster      = "Covariables/SQIw_RF_RK_prediction.tif"
-out_rf_std_raster    = "Covariables/SQIw_RF_RK_uncertainty_rf_std.tif"
-out_rk_std_raster    = "Covariables/SQIw_RF_RK_uncertainty_rk_std.tif"
-out_total_std_raster = "Covariables/SQIw_RF_RK_uncertainty_total_std.tif"
-out_total_cv_raster  = "Covariables/SQIw_RF_RK_uncertainty_total_cv.tif"
+out_pred_raster      = "gis/Covariables/SQIw_RF_RK_prediction.tif"
+out_rf_std_raster    = "gis/Covariables/SQIw_RF_RK_uncertainty_rf_std.tif"
+out_rk_std_raster    = "gis/Covariables/SQIw_RF_RK_uncertainty_rk_std.tif"
+out_total_std_raster = "gis/Covariables/SQIw_RF_RK_uncertainty_total_std.tif"
+out_total_cv_raster  = "gis/Covariables/SQIw_RF_RK_uncertainty_total_cv.tif"
 
 window_size = 512
 krige_chunk = 50000
@@ -1578,7 +1860,7 @@ import matplotlib.pyplot as plt
 # ----------------------------
 # ARCHIVO
 # ----------------------------
-raster_file = "Covariables/SQIw_RF_RK_prediction.tif"
+raster_file = "gis/Covariables/SQIw_RF_RK_prediction.tif"
 
 # ----------------------------
 # LEER RASTER
@@ -1630,7 +1912,7 @@ import matplotlib.pyplot as plt
 # ----------------------------
 # ARCHIVO
 # ----------------------------
-raster_file = "Covariables/SQIw_RF_RK_uncertainty_total_std.tif"
+raster_file = "gis/Covariables/SQIw_RF_RK_uncertainty_total_std.tif"
 
 # ----------------------------
 # LEER RASTER
