@@ -1,5 +1,5 @@
 ---
-title: "Hybrid machine learning–geostatistical modelling of soil quality in saline, sodic and alkaline soils under arid agroecosystems"
+title: "Hybrid machine learning–geostatistical modelling of soil quality in in saline–sodic soils under arid agroecosystems of northwestern Peru"
 format:
   html:
     toc: true
@@ -129,7 +129,7 @@ def ccc_lin(y_true, y_pred):
 
     return float((2 * cov) / denom)
 
-def metrics(y_true, y_pred):
+def compute_metrics(y_true, y_pred):
 
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
@@ -301,6 +301,11 @@ feature_names = predictor_names + ["Xcoord", "Ycoord"]
 print("[3/3] Limpiando registros con NA...")
 
 mask_valid = (~np.isnan(X).any(axis=1)) & (~np.isnan(y))
+
+# Preserve the exact analytical sample used by the full models so that
+# the reduced model is evaluated on the same observations.
+comparison_mask = mask_valid.copy()
+
 X = X[mask_valid]
 y = y[mask_valid]
 coords = coords[mask_valid]
@@ -310,7 +315,7 @@ print(f"✅ Puntos válidos: {len(y)}")
 print(f"✅ Número total de predictores: {X.shape[1]}")
 ```
 
-## Hyperparameter Optimization of Random Forest Using Optuna (Random Cross-Validation) 
+## Hyperparameter Optimization Function for Nested Cross-Validation 
 
 ```{python}
 from sklearn.model_selection import train_test_split
@@ -374,190 +379,126 @@ def optimize_rf_with_optuna(
     return best_params, study.best_value, study
 ```
 
-## Cross-Validation Strategy
+## Nested Cross-Validation Strategy
 
 ```{python}
+# Outer CV is used ONLY for final performance estimation.
+# Hyperparameter tuning is performed independently inside each outer-training set.
 kf_outer = KFold(n_splits=k_folds_outer, shuffle=True, random_state=random_seed)
 splits = list(kf_outer.split(X))
 
-rows = []
+# Preserve the exact OUTER folds for the later reduced-model comparison.
+splits_full = [(tr.copy(), te.copy()) for tr, te in splits]
 
-# Residuales OOF para variogramas experimentales
+rows = []
+outer_best_params_rows = []
+
+# OOF residuals/predictions are generated exclusively from held-out OUTER test folds.
 resid_oof_ok = np.full_like(y, fill_value=np.nan, dtype="float64")
 resid_oof_rf = np.full_like(y, fill_value=np.nan, dtype="float64")
 resid_oof_rk = np.full_like(y, fill_value=np.nan, dtype="float64")
-
-# Predicciones OOF
 pred_oof_ok = np.full_like(y, fill_value=np.nan, dtype="float64")
 pred_oof_rf = np.full_like(y, fill_value=np.nan, dtype="float64")
 pred_oof_rk = np.full_like(y, fill_value=np.nan, dtype="float64")
 
-# ------------------------------------------------------------
-# Optuna para RF
-# ------------------------------------------------------------
-print("\n🚀 Optuna: RandomForest")
-
-best_rf_params, best_cv_rmse, study_rf = optimize_rf_with_optuna(
-    X=X,
-    y=y,
-    splits=splits,
-    seed=random_seed,
-    n_trials=n_trials_optuna,
-    timeout=optuna_timeout
-)
-
-print("\n=== MEJOR RF (Optuna + Random CV) ===")
-print("Best CV RMSE:", best_cv_rmse)
-print("Best params:", best_rf_params)
-
-best_params_rows = [{
-    "best_cv_rmse": best_cv_rmse,
-    **best_rf_params
-}]
-
-# ------------------------------------------------------------
-# Evaluación final
-# ------------------------------------------------------------
 for fold_id, (train_idx, test_idx) in enumerate(splits, start=1):
-    
+    print(f"\n===== OUTER FOLD {fold_id}/{k_folds_outer} =====")
+
     X_train, X_test = X[train_idx], X[test_idx]
     y_train, y_test = y[train_idx], y[test_idx]
     coords_train, coords_test = coords[train_idx], coords[test_idx]
 
     # --------------------------------------------------------
-    # (1) OK
+    # INNER CV + Optuna: uses ONLY the outer-training set
     # --------------------------------------------------------
+    kf_inner = KFold(
+        n_splits=5, shuffle=True, random_state=random_seed + fold_id
+    )
+    inner_splits = list(kf_inner.split(X_train))
+
+    best_params_fold, best_inner_rmse, _ = optimize_rf_with_optuna(
+        X=X_train,
+        y=y_train,
+        splits=inner_splits,
+        seed=random_seed + fold_id,
+        n_trials=n_trials_optuna,
+        timeout=optuna_timeout
+    )
+
+    outer_best_params_rows.append({
+        "outer_fold": fold_id,
+        "best_inner_cv_rmse": best_inner_rmse,
+        **best_params_fold
+    })
+
+    print("Best INNER CV RMSE:", best_inner_rmse)
+    print("Best params:", best_params_fold)
+
+    # (1) Ordinary Kriging: outer train -> outer test
     pred_ok, vm_ok = fit_ok_and_predict(
-        coords_train=coords_train,
-        values_train=y_train,
-        coords_test=coords_test,
+        coords_train=coords_train, values_train=y_train, coords_test=coords_test,
         variogram_model=variogram_model_cv,
         fallback_models=tuple(variogram_models_fallback)
     )
-
     pred_oof_ok[test_idx] = pred_ok
     resid_oof_ok[test_idx] = y_test - pred_ok
+    m_ok = compute_metrics(y_test, pred_ok)
+    rows.append([fold_id, "OrdinaryKriging", m_ok["RMSE"], m_ok["MAE"],
+                 m_ok["R2"], m_ok["nRMSE_%"], m_ok["RelError_%"], m_ok["CCC"], vm_ok])
 
-    m_ok = metrics(y_test, pred_ok)
-
-    rows.append([
-        fold_id,
-        "OrdinaryKriging",
-        m_ok["RMSE"],
-        m_ok["MAE"],
-        m_ok["R2"],
-        m_ok["nRMSE_%"],
-        m_ok["RelError_%"],
-        m_ok["CCC"],
-        vm_ok
-    ])
-
-    # --------------------------------------------------------
-    # (2) RF con mejores hiperparámetros globales de Optuna
-    # --------------------------------------------------------
-    rf = RandomForestRegressor(**best_rf_params)
+    # (2) RF tuned only within this outer-training set
+    rf = RandomForestRegressor(**best_params_fold)
     rf.fit(X_train, y_train)
-
     pred_rf = rf.predict(X_test)
     pred_oof_rf[test_idx] = pred_rf
     resid_oof_rf[test_idx] = y_test - pred_rf
+    m_rf = compute_metrics(y_test, pred_rf)
+    rows.append([fold_id, "RandomForest_XY", m_rf["RMSE"], m_rf["MAE"],
+                 m_rf["R2"], m_rf["nRMSE_%"], m_rf["RelError_%"], m_rf["CCC"], "NA"])
 
-    m_rf = metrics(y_test, pred_rf)
-
-    rows.append([
-        fold_id,
-        "RandomForest_XY",
-        m_rf["RMSE"],
-        m_rf["MAE"],
-        m_rf["R2"],
-        m_rf["nRMSE_%"],
-        m_rf["RelError_%"],
-        m_rf["CCC"],
-        "NA"
-    ])
-
-    # --------------------------------------------------------
-    # (3) RF + RK
-    # --------------------------------------------------------
+    # (3) RF + residual kriging, evaluated on the same outer test fold
     resid_rf_train = y_train - rf.predict(X_train)
-
     krig_resid_rf, vm_rk = fit_ok_and_predict(
-        coords_train=coords_train,
-        values_train=resid_rf_train,
-        coords_test=coords_test,
+        coords_train=coords_train, values_train=resid_rf_train, coords_test=coords_test,
         variogram_model=variogram_model_cv,
         fallback_models=tuple(variogram_models_fallback)
     )
-
     pred_rf_rk = pred_rf + krig_resid_rf
-
     pred_oof_rk[test_idx] = pred_rf_rk
     resid_oof_rk[test_idx] = y_test - pred_rf_rk
+    m_rk = compute_metrics(y_test, pred_rf_rk)
+    rows.append([fold_id, "RandomForest_XY+RK", m_rk["RMSE"], m_rk["MAE"],
+                 m_rk["R2"], m_rk["nRMSE_%"], m_rk["RelError_%"], m_rk["CCC"], vm_rk])
 
-    m_rk = metrics(y_test, pred_rf_rk)
+# Fold-level OUTER-test metrics used in Table 4
+df_folds = pd.DataFrame(rows, columns=[
+    "fold", "model", "RMSE", "MAE", "R2", "nRMSE_%",
+    "RelError_%", "CCC", "variogram_used"
+])
 
-    rows.append([
-        fold_id,
-        "RandomForest_XY+RK",
-        m_rk["RMSE"],
-        m_rk["MAE"],
-        m_rk["R2"],
-        m_rk["nRMSE_%"],
-        m_rk["RelError_%"],
-        m_rk["CCC"],
-        vm_rk
-    ])
-
-# ------------------------------------------------------------
-#  Guardar métricas por fold
-# ------------------------------------------------------------
-
-df_folds = pd.DataFrame(
-    rows,
-    columns=[
-        "fold",
-        "model",
-        "RMSE",
-        "MAE",
-        "R2",
-        "nRMSE_%",
-        "RelError_%",
-        "CCC",
-        "variogram_used"
-    ]
-)
-
-print("\n=== CV métricas por fold ===")
+# Hyperparameters selected independently in each outer fold (diagnostic only).
+df_outer_best_params = pd.DataFrame(outer_best_params_rows)
 display(df_folds)
+display(df_outer_best_params)
 
-df_folds.to_csv(os.path.join(out_folder, "cv_metrics_by_fold.csv"), index=False)
-
-# Guardar mejores hiperparámetros globales de RF
-df_best_params = pd.DataFrame(best_params_rows)
-df_best_params.to_csv(os.path.join(out_folder, "rf_best_params_randomcv.csv"), index=False)
-
-print("\n=== CV métricas por fold ===")
-print(df_folds.head(12))
-
-df_summary = (
-    df_folds
-    .groupby("model")
-    .agg({
-        "RMSE": ["mean", "std"],
-        "MAE": ["mean", "std"],
-        "R2": ["mean", "std"],
-        "nRMSE_%": ["mean", "std"],
-        "RelError_%": ["mean", "std"],
-        "CCC": ["mean", "std"]
-    })
-    .round(4)
+# ------------------------------------------------------------------
+# Final full-data tuning for the deployable/map model ONLY.
+# These results are NOT used for Table 4 performance estimation.
+# ------------------------------------------------------------------
+print("\n🚀 Final Optuna tuning on the complete dataset (deployment only)")
+kf_final = KFold(n_splits=5, shuffle=True, random_state=random_seed + 1000)
+final_inner_splits = list(kf_final.split(X))
+best_rf_params, best_cv_rmse, study_rf = optimize_rf_with_optuna(
+    X=X, y=y, splits=final_inner_splits, seed=random_seed + 1000,
+    n_trials=n_trials_optuna, timeout=optuna_timeout
 )
+print("Final full-data CV RMSE (deployment tuning only):", best_cv_rmse)
+print("Final params:", best_rf_params)
 
-print("\n=== Resumen mean ± std ===")
-display(df_summary)
+best_params_rows = [{"best_cv_rmse": best_cv_rmse, **best_rf_params}]
 ```
 
-## Model Comparison Using Friedman and Nemenyi Tests with Compact Letter Display (CLD)
+## Preliminary Model Comparison (Full Predictor Set): Friedman and Nemenyi Tests
 
 ```{python}
 print("\nEjecutando Friedman + Nemenyi + letras...")
@@ -690,7 +631,7 @@ for model_name in models:
         )
 
 final_table.to_csv(
-    os.path.join(out_folder, "final_table_meanstd_letters.csv")
+    os.path.join(out_folder, "preliminary_full_models_meanstd_letters.csv")
 )
 
 print("\n=== Tabla final: mean ± sd with CLD ===")
@@ -702,7 +643,7 @@ display(final_table)
 
 import pandas as pd
 
-df = pd.read_csv("paper_outputs_xy_optuna/final_table_meanstd_letters.csv", index_col=0)
+df = pd.read_csv("paper_outputs_xy_optuna/preliminary_full_models_meanstd_letters.csv", index_col=0)
 
 df.style.set_properties(**{
     'text-align': 'center'
@@ -951,7 +892,7 @@ print(" - variogram_fit_table_OK_RK_oof.csv")
 print(" - oof_predictions_residuals.csv")
 ```
 
-![Experimental variograms derived from cross-validation residuals.](paper_outputs_xy_optuna/variogram_experimental_4series.jpg)
+![Experimental variograms derived from cross-validation residuals.](paper_outputs_xy_optuna/variogram_experimental_residuals_only.jpg)
 
 ## Saving the Random Forest Model
 
@@ -988,146 +929,181 @@ else:
 ```
 
 <!--
-# PERMUTATION IMPORTANCE – RandomForest (RANDOM CV)
-> Carga el modelo RF guardado (joblib)
-> Usa los mismos splits Random CV (KFold shuffle=True)
-> Calcula importancia en el TEST de cada fold
-> Reporta mean ± std y grafica barras (Top N)
+# PERMUTATION IMPORTANCE – Random Forest (NESTED CV OUTER TEST FOLDS)
+> Uses the RF hyperparameters selected independently within each outer-training fold.
+> Permutation importance is calculated ONLY on the held-out outer test fold.
+> With scoring = -RMSE, sklearn importance is already ΔRMSE = RMSE_permuted - RMSE_baseline.
 -->
 
-# Permutation Importance of the Random Forest Model (Random Cross-Validation)
+# Permutation Importance of the Random Forest Model (Nested Cross-Validation)
 
 ## Project Setup
 ```{python}
 import numpy as np
 import pandas as pd
-import joblib
 import matplotlib.pyplot as plt
 
-from sklearn.model_selection import KFold
 from sklearn.inspection import permutation_importance
 from sklearn.metrics import mean_squared_error
-from sklearn.base import clone
+from sklearn.ensemble import RandomForestRegressor
 ```
 
 ## General Computational Settings
 
 ```{python}
-rf_model_path = "saved_models/random_forest_model.joblib"   # <- cambia al nombre real
-k_folds = 5
-random_seed = 42
 perm_repeats = 30
 TOP_N = 18
 ```
 
-## Loading the Trained Model
+## Feature Names
 
 ```{python}
 if "feature_names" not in globals():
-    # Si tu X = [predictor_names + coords], usa:
     feature_names = predictor_names + ["Xcoord", "Ycoord"]
-    # Si NO incluyes coords, usa solo:
-    # feature_names = predictor_names
+
+assert len(feature_names) == X.shape[1], (
+    f"feature_names ({len(feature_names)}) does not match X columns ({X.shape[1]})."
+)
 ```
 
-## Loading the Saved Model
-
-```{python}
-rf_saved = joblib.load(rf_model_path)
-print(f"✅ Modelo RF cargado: {rf_model_path}")
-print(f"Tipo: {type(rf_saved)}")
-```
-
-## Random Cross-Validation Using Identical Folds for All Models
-
-```{python}
-kf = KFold(n_splits=k_folds, shuffle=True, random_state=random_seed)
-splits = list(kf.split(X))
-```
-
-## RMSE Scoring Function (Negative RMSE for Optimization in Scikit-learn)
+## RMSE Scoring Function
 
 ```{python}
 def neg_rmse_scorer(estimator, X_eval, y_eval):
+    """Higher-is-better scorer required by sklearn: score = -RMSE."""
     y_pred = estimator.predict(X_eval)
-    rmse = np.sqrt(mean_squared_error(y_eval, y_pred))
-    return -rmse
+    return -np.sqrt(mean_squared_error(y_eval, y_pred))
 ```
 
-## Permutation Importance on the Test Set of Each Fold
+## Permutation Importance on Held-out Outer Test Folds
 
 ```{python}
+# IMPORTANT:
+# - splits_full contains the same held-out OUTER folds used for Table 4.
+# - df_outer_best_params contains RF hyperparameters tuned ONLY inside each
+#   corresponding outer-training set.
+# - Therefore, the outer test observations are not used for hyperparameter tuning.
+
 rows = []
 
-for fold_id, (train_idx, test_idx) in enumerate(splits, start=1):
+param_cols = [
+    c for c in df_outer_best_params.columns
+    if c not in {"outer_fold", "best_inner_cv_rmse"}
+]
+
+for fold_id, (train_idx, test_idx) in enumerate(splits_full, start=1):
     X_train, X_test = X[train_idx], X[test_idx]
     y_train, y_test = y[train_idx], y[test_idx]
 
-    # Clonamos para reentrenar por fold con el mismo set de hiperparámetros
-    model = clone(rf_saved)
+    fold_row = df_outer_best_params.loc[
+        df_outer_best_params["outer_fold"] == fold_id
+    ]
+    if fold_row.empty:
+        raise ValueError(f"No tuned RF hyperparameters found for outer fold {fold_id}.")
+
+    best_params_fold = fold_row.iloc[0][param_cols].to_dict()
+
+    # Restore integer-valued hyperparameters after DataFrame coercion, if needed.
+    for p in ["n_estimators", "max_depth", "min_samples_leaf", "min_samples_split"]:
+        if p in best_params_fold and pd.notna(best_params_fold[p]):
+            best_params_fold[p] = int(best_params_fold[p])
+
+    # Remove missing values and enforce reproducibility/parallelism.
+    best_params_fold = {
+        k: v for k, v in best_params_fold.items() if pd.notna(v)
+    }
+    best_params_fold["random_state"] = random_seed + fold_id
+    best_params_fold["n_jobs"] = -1
+
+    model = RandomForestRegressor(**best_params_fold)
     model.fit(X_train, y_train)
+
+    baseline_rmse = np.sqrt(mean_squared_error(y_test, model.predict(X_test)))
 
     r = permutation_importance(
         model,
-        X_test, y_test,
-        scoring=neg_rmse_scorer,     # retorna -RMSE
+        X_test,
+        y_test,
+        scoring=neg_rmse_scorer,
         n_repeats=perm_repeats,
-        random_state=random_seed,
+        random_state=random_seed + fold_id,
         n_jobs=-1
     )
 
-    # Convertimos delta(-RMSE) -> incremento de RMSE
-    delta_rmse_mean = -r.importances_mean
-    delta_rmse_std  = r.importances_std
+    # sklearn defines importance = baseline_score - permuted_score.
+    # Since score = -RMSE:
+    # importance = (-RMSE_baseline) - (-RMSE_permuted)
+    #            = RMSE_permuted - RMSE_baseline = ΔRMSE.
+    # Therefore, DO NOT reverse the sign.
+    delta_rmse_mean = r.importances_mean
+    delta_rmse_std = r.importances_std
 
     for j, fname in enumerate(feature_names):
-        rows.append([fold_id, fname, float(delta_rmse_mean[j]), float(delta_rmse_std[j])])
+        rows.append([
+            fold_id,
+            fname,
+            float(baseline_rmse),
+            float(delta_rmse_mean[j]),
+            float(delta_rmse_std[j])
+        ])
 
-df_imp = pd.DataFrame(rows, columns=["fold", "feature", "delta_RMSE_mean", "delta_RMSE_std"])
 
+df_imp = pd.DataFrame(
+    rows,
+    columns=[
+        "outer_fold", "feature", "baseline_RMSE",
+        "delta_RMSE_mean", "delta_RMSE_within_fold_std"
+    ]
+)
+
+# The manuscript summary is based on variability ACROSS independent outer folds.
 summary = (
     df_imp.groupby("feature")["delta_RMSE_mean"]
-    .agg(["mean", "std"])
+    .agg(mean="mean", std="std", min="min", max="max")
     .sort_values("mean", ascending=False)
     .reset_index()
 )
 
-print("\n=== PERMUTATION IMPORTANCE – RandomForest (ΔRMSE) ===")
+print("\n=== PERMUTATION IMPORTANCE – RF, NESTED CV OUTER TEST FOLDS (ΔRMSE) ===")
+print("Positive ΔRMSE: prediction worsens after permutation -> useful predictor.")
+print("Near-zero ΔRMSE: little predictive contribution.")
+print("Negative ΔRMSE: permutation improves prediction -> possible redundancy/noise/instability.")
 print(summary.head(20).to_string(index=False))
 ```
 
 ## Bar Plot of the Top N Most Important Features
 
 ```{python}
-plot_df = summary.head(TOP_N).copy()
-plot_df = plot_df.sort_values("mean", ascending=True)
-
+plot_df = summary.head(TOP_N).copy().sort_values("mean", ascending=True)
 ypos = np.arange(len(plot_df))
 
-plt.figure()
-plt.barh(ypos, plot_df["mean"])
+plt.figure(figsize=(8, max(5, 0.35 * len(plot_df))))
+plt.barh(ypos, plot_df["mean"], xerr=plot_df["std"])
 plt.yticks(ypos, plot_df["feature"])
-plt.xlabel("Variación de RMSE al permutar la variable (ΔRMSE)")
-plt.title(f"Permutation Importance – RandomForest")
+plt.axvline(0, linewidth=0.8)
+plt.xlabel("Increase in RMSE after permutation (ΔRMSE)")
+plt.title("Permutation Importance – Random Forest (Nested CV outer test folds)")
 plt.tight_layout()
 
-# Guardar imagen en alta resolución
-plt.savefig("permutation_importance_rf.jpg", dpi=600, bbox_inches="tight")
-
+plt.savefig(
+    "paper_outputs_xy_optuna/permutation_importance_rf_nested_cv.jpg",
+    dpi=600,
+    bbox_inches="tight"
+)
 plt.show()
 ```
 
-![Permutation importance.](paper_outputs_xy_optuna/permutation_importance_rf.jpg)
+![Permutation importance of the Random Forest model calculated on held-out outer test folds of the nested cross-validation. Positive ΔRMSE indicates loss of predictive accuracy after permutation.](paper_outputs_xy_optuna/permutation_importance_rf_nested_cv.jpg)
 
 ## Saving Results
 
 ```{python}
-df_imp.to_csv(os.path.join(out_folder,"perm_importance_RF_randomCV_folds.csv"), index=False)
-summary.to_csv(os.path.join(out_folder,"perm_importance_RF_randomCV_summary.csv"), index=False)
+df_imp.to_csv(os.path.join(out_folder,"perm_importance_RF_nested_outer_folds.csv"), index=False)
+summary.to_csv(os.path.join(out_folder,"perm_importance_RF_nested_outer_summary.csv"), index=False)
 
 print("\n📌 Archivos generados:")
-print(" - perm_importance_RF_randomCV_folds.csv")
-print(" - perm_importance_RF_randomCV_summary.csv")
+print(" - perm_importance_RF_nested_outer_folds.csv")
+print(" - perm_importance_RF_nested_outer_summary.csv")
 ```
 
 <!--
@@ -1204,42 +1180,10 @@ def extract_raster_values(raster_path, points_xy):
 # ------------------------------------------------------------
 # Error metrics
 # ------------------------------------------------------------
-
-def rmse(y_true, y_pred):
-    return float(np.sqrt(mean_squared_error(y_true, y_pred)))
-
-def mae(y_true, y_pred):
-    return float(mean_absolute_error(y_true, y_pred))
-
-def r2(y_true, y_pred):
-    return float(r2_score(y_true, y_pred))
-
-def nrmse(y_true, y_pred):
-    """
-    Normalized RMSE (%)
-    Normalized by mean observed value
-    """
-    return (
-        np.sqrt(mean_squared_error(y_true, y_pred))
-        / np.mean(y_true)
-        * 100
-    )
-
-def relative_error(y_true, y_pred):
-    """
-    Mean Relative Error (%)
-    """
-    return np.mean(
-        np.abs((y_true - y_pred) / y_true)
-    ) * 100
-
-def cc(y_true, y_pred):
-    """
-    Pearson Correlation Coefficient
-    """
-    return float(
-        np.corrcoef(y_true, y_pred)[0, 1]
-    )
+# The reduced model uses the SAME metric functions defined for the full
+# models above: compute_metrics(), ccc_lin(), and rmse_func(). This guarantees
+# identical definitions for RMSE, MAE, R2, nRMSE, relative error
+# (MAPE-style), and Lin's concordance correlation coefficient (CCC).
 
 # ------------------------------------------------------------
 # Kriging functions
@@ -1315,211 +1259,219 @@ X = np.column_stack([
 ## Data Cleaning: Handling Missing Values
 
 ```{python}
-mask_valid = (~np.isnan(X).any(axis=1)) & (~np.isnan(y))
+mask_valid_reduced = (~np.isnan(X).any(axis=1)) & (~np.isnan(y))
+
+# Use exactly the same observations as in the full-model comparison.
+if "comparison_mask" not in globals():
+    raise RuntimeError("comparison_mask from the full-model section is not available.")
+
+# Do not silently change the analytical sample because of missing values
+# in the reduced predictor set.
+if np.any(comparison_mask & ~mask_valid_reduced):
+    raise ValueError(
+        "At least one observation used by the full models has missing values "
+        "in the reduced predictor set. Check raster extraction before comparing models."
+    )
+
+mask_valid = comparison_mask.copy()
 X = X[mask_valid]
 y = y[mask_valid]
 coords = coords[mask_valid]
 
-print(f"✅ Puntos válidos: {len(y)}")
+print(f"✅ Puntos válidos (same sample as full models): {len(y)}")
 print(f"✅ Variables usadas: {feature_names}")
 print(f"✅ Dimensión de X: {X.shape}")
 ```
 
-## Random Cross-Validation Using Identical Folds
+## Nested Cross-Validation for the Reduced RF + Residual Kriging Model
 
 ```{python}
-kf = KFold(n_splits=k_folds, shuffle=True, random_state=random_seed)
-splits = list(kf.split(X))
-```
+if "splits_full" not in globals():
+    raise RuntimeError("Outer folds from the full-model section are not available.")
 
-## Hyperparameter Optimization Using Optuna (Random Cross-Validation)
+# EXACTLY the same outer test partitions used for OK, RF and full RF+RK.
+splits = [(tr.copy(), te.copy()) for tr, te in splits_full]
+if max(max(tr.max(), te.max()) for tr, te in splits) >= len(y):
+    raise ValueError("Stored outer folds are incompatible with the reduced-model sample.")
 
-```{python}
-def eval_rf_rk_rmse(params):
-    rmses = []
+def optimize_reduced_rf_rk_inner(X_inner, y_inner, coords_inner, seed, n_trials, timeout=None):
+    """Tune reduced RF+RK only within one outer-training set."""
+    kf_inner = KFold(n_splits=5, shuffle=True, random_state=seed)
+    inner_splits = list(kf_inner.split(X_inner))
 
-    for train_idx, test_idx in splits:
-        X_train, X_test = X[train_idx], X[test_idx]
-        y_train, y_test = y[train_idx], y[test_idx]
-        coords_train, coords_test = coords[train_idx], coords[test_idx]
+    def objective(trial):
+        params = {
+            "n_estimators": trial.suggest_int("n_estimators", 200, 2000, step=100),
+            "max_depth": trial.suggest_int("max_depth", 4, 40),
+            "min_samples_split": trial.suggest_int("min_samples_split", 2, 20),
+            "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 10),
+            "max_features": trial.suggest_categorical(
+                "max_features", ["sqrt", "log2", 0.5, 0.7, 1.0]
+            ),
+        }
+        rmses = []
+        for tr, va in inner_splits:
+            rf = RandomForestRegressor(
+                **params, bootstrap=True, random_state=seed, n_jobs=-1
+            )
+            rf.fit(X_inner[tr], y_inner[tr])
+            pred_rf_va = rf.predict(X_inner[va])
+            resid_tr = y_inner[tr] - rf.predict(X_inner[tr])
+            ok_model = fit_ok(
+                coords_inner[tr], resid_tr, variogram_model=variogram_model_ok
+            )
+            krig_va = ok_predict_points(ok_model, coords_inner[va])
+            rmses.append(rmse_func(y_inner[va], pred_rf_va + krig_va))
+        return float(np.mean(rmses))
 
-        rf = RandomForestRegressor(
-            **params,
-            bootstrap=True,
-            random_state=random_seed,
-            n_jobs=-1
-        )
-        rf.fit(X_train, y_train)
+    study = optuna.create_study(
+        direction="minimize", sampler=optuna.samplers.TPESampler(seed=seed)
+    )
+    study.optimize(objective, n_trials=n_trials, timeout=timeout, show_progress_bar=False)
+    return study.best_params.copy(), study.best_value, study
 
-        pred_rf_test = rf.predict(X_test)
-
-        resid_train = y_train - rf.predict(X_train)
-        ok_model = fit_ok(coords_train, resid_train, variogram_model=variogram_model_ok)
-        krig_resid_test = ok_predict_points(ok_model, coords_test)
-
-        pred_final = pred_rf_test + krig_resid_test
-        rmses.append(rmse(y_test, pred_final))
-
-    return float(np.mean(rmses))
-
-def objective(trial):
-    params = {
-        "n_estimators": trial.suggest_int("n_estimators", 200, 2000, step=100),
-        "max_depth": trial.suggest_int("max_depth", 4, 40),
-        "min_samples_split": trial.suggest_int("min_samples_split", 2, 20),
-        "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 10),
-        "max_features": trial.suggest_categorical("max_features", ["sqrt", "log2", 0.5, 0.7, 1.0]),
-    }
-    return eval_rf_rk_rmse(params)
-
-print("\n🚀 Optuna optimizando Random Forest + RK...")
-study = optuna.create_study(
-    direction="minimize",
-    sampler=optuna.samplers.TPESampler(seed=random_seed)
-)
-study.optimize(objective, n_trials=optuna_trials_rf, timeout=timeout_seconds)
-
-best_params_rf = study.best_params
-print("\n=== MEJORES HIPERPARÁMETROS RF+RK ===")
-print("Best RMSE:", study.best_value)
-print("Best params:", best_params_rf)
-```
-
-## Final Model Evaluation
-
-```{python}
 rows = []
-
+reduced_outer_params = []
 pred_oof_rf = np.full_like(y, fill_value=np.nan, dtype="float64")
 pred_oof_rk = np.full_like(y, fill_value=np.nan, dtype="float64")
 resid_oof_rk = np.full_like(y, fill_value=np.nan, dtype="float64")
 
 for fold_id, (train_idx, test_idx) in enumerate(splits, start=1):
-
+    print(f"\n===== REDUCED MODEL - OUTER FOLD {fold_id}/5 =====")
     X_train, X_test = X[train_idx], X[test_idx]
     y_train, y_test = y[train_idx], y[test_idx]
-
     coords_train, coords_test = coords[train_idx], coords[test_idx]
 
-    # RF
-    rf = RandomForestRegressor(
-        **best_params_rf,
-        random_state=random_seed,
-        n_jobs=-1
+    # INNER CV + Optuna uses only outer-training observations.
+    best_params_fold, best_inner_rmse, _ = optimize_reduced_rf_rk_inner(
+        X_train, y_train, coords_train, seed=random_seed + 100 + fold_id,
+        n_trials=optuna_trials_rf, timeout=timeout_seconds
     )
+    reduced_outer_params.append({
+        "outer_fold": fold_id, "best_inner_cv_rmse": best_inner_rmse,
+        **best_params_fold
+    })
 
+    rf = RandomForestRegressor(
+        **best_params_fold, bootstrap=True,
+        random_state=random_seed + 100 + fold_id, n_jobs=-1
+    )
     rf.fit(X_train, y_train)
-
     pred_rf = rf.predict(X_test)
 
-    # RK
     resid_train = y_train - rf.predict(X_train)
-
-    ok_model = fit_ok(
-        coords_train,
-        resid_train,
-        variogram_model=variogram_model_ok
-    )
-
-    krig_resid_test = ok_predict_points(
-        ok_model,
-        coords_test
-    )
-
+    ok_model = fit_ok(coords_train, resid_train, variogram_model=variogram_model_ok)
+    krig_resid_test = ok_predict_points(ok_model, coords_test)
     pred_final = pred_rf + krig_resid_test
 
-    # OOF
     pred_oof_rf[test_idx] = pred_rf
     pred_oof_rk[test_idx] = pred_final
     resid_oof_rk[test_idx] = y_test - pred_final
 
-    # Métricas
-    fold_rmse = rmse(y_test, pred_final)
-    fold_mae = mae(y_test, pred_final)
-    fold_r2 = r2_score(y_test, pred_final)
+    # TABLE 4 METRICS: held-out OUTER test fold only.
+    m_red = compute_metrics(y_test, pred_final)
+    rows.append([fold_id, m_red["RMSE"], m_red["MAE"], m_red["R2"],
+                 m_red["nRMSE_%"], m_red["RelError_%"], m_red["CCC"]])
+    print(f"Outer-test RMSE={m_red['RMSE']:.4f} | MAE={m_red['MAE']:.4f} | "
+          f"R2={m_red['R2']:.4f} | nRMSE={m_red['nRMSE_%']:.2f}% | "
+          f"RelError={m_red['RelError_%']:.2f}% | CCC={m_red['CCC']:.4f}")
 
-    fold_nrmse = (
-        fold_rmse / np.mean(y_test)
-    ) * 100
+df_cv = pd.DataFrame(rows, columns=[
+    "fold", "RMSE", "MAE", "R2", "nRMSE_%", "RelError_%", "CCC"
+])
+df_reduced_outer_params = pd.DataFrame(reduced_outer_params)
+print("\n=== Reduced RF+RK: OUTER-test metrics ===")
+display(df_cv)
+print("\n=== Reduced RF+RK: hyperparameters selected inside each outer fold ===")
+display(df_reduced_outer_params)
 
-    fold_relerror = (
-    fold_mae / np.mean(y_test)
-    ) * 100
+df_cv.to_csv("paper_outputs_xy_optuna/RF_reducido_RK_nested_outer_metrics.csv", index=False)
+df_reduced_outer_params.to_csv(
+    "paper_outputs_xy_optuna/RF_reducido_RK_nested_inner_best_params.csv", index=False
+)
 
-    fold_cc = np.corrcoef(
-        y_test,
-        pred_final
-    )[0, 1]
+# ------------------------------------------------------------
+# Table 4: all values come ONLY from held-out OUTER test folds
+# ------------------------------------------------------------
+df_reduced_for_comparison = df_cv.copy()
+df_reduced_for_comparison.insert(1, "model", "Reduced_RF+RK")
+df_reduced_for_comparison["variogram_used"] = variogram_model_ok
+comparison_cols = ["fold", "model", "RMSE", "MAE", "R2",
+                   "nRMSE_%", "RelError_%", "CCC", "variogram_used"]
+df_folds_4models = pd.concat([
+    df_folds[comparison_cols].copy(),
+    df_reduced_for_comparison[comparison_cols].copy()
+], ignore_index=True)
 
-    rows.append([
-        fold_id,
-        fold_rmse,
-        fold_mae,
-        fold_r2,
-        fold_nrmse,
-        fold_relerror,
-        fold_cc
-    ])
-
-    print(
-        f"Fold {fold_id}: "
-        f"RMSE={fold_rmse:.4f} | "
-        f"MAE={fold_mae:.4f} | "
-        f"R2={fold_r2:.4f} | "
-        f"nRMSE={fold_nrmse:.2f}% | "
-        f"RelError={fold_relerror:.2f}% | "
-        f"CC={fold_cc:.4f}"
+model_order_4 = ["OrdinaryKriging", "RandomForest_XY",
+                 "RandomForest_XY+RK", "Reduced_RF+RK"]
+model_labels_4 = {
+    "OrdinaryKriging": "Ordinary Kriging",
+    "RandomForest_XY": "Random Forest (RF)",
+    "RandomForest_XY+RK": "RF + Residual Kriging",
+    "Reduced_RF+RK": "Reduced RF + Residual Kriging"
+}
+metrics_info_4 = {"RMSE": False, "MAE": False, "R2": True,
+                  "nRMSE_%": False, "RelError_%": False, "CCC": True}
+summary_4 = df_folds_4models.groupby("model")[list(metrics_info_4)].agg(["mean", "std"])
+results_stats_4 = {}
+for metric, higher_is_better in metrics_info_4.items():
+    pv = metric_pivot(df_folds_4models, metric, model_order_4)
+    p_f = friedman_test_from_pivot(pv)
+    pvals = nemenyi_from_pivot(pv)
+    means = pv.mean(axis=0)
+    letters = cld_letters_from_pvals(
+        pvals, means, alpha=alpha, higher_is_better=higher_is_better
     )
+    results_stats_4[metric] = {"friedman_p": p_f, "nemenyi_pvals": pvals,
+                               "means": means, "letters": letters}
+    print(f"\n================ {metric} ================")
+    print(f"Friedman p-value (4 models; OUTER test folds): {p_f:.6f}")
+    for model_name in model_order_4:
+        print(f"  {model_labels_4[model_name]:32s} -> ({letters[model_name]})")
+    pvals.to_csv(os.path.join(out_folder, f"nemenyi_4models_{metric}.csv"))
 
-# ------------------------------------------------------------
-# Tabla CV
-# ------------------------------------------------------------
+def format_mean_std_letter_4(model, metric):
+    mean_value = summary_4.loc[model, (metric, "mean")]
+    std_value = summary_4.loc[model, (metric, "std")]
+    letter = results_stats_4[metric]["letters"][model]
+    return f"{mean_value:.4f} ± {std_value:.4f} ({letter})"
 
-df_cv = pd.DataFrame(
-    rows,
-    columns=[
-        "fold",
-        "RMSE",
-        "MAE",
-        "R2",
-        "nRMSE_%",
-        "RelError_%",
-        "CC"
-    ]
-)
-
-print("\n=== Resumen (mean ± std) ===")
-print(
-    df_cv.drop(columns=["fold"])
-         .agg(["mean", "std"])
-         .T
-)
-
-# ------------------------------------------------------------
-# Guardar métricas
-# ------------------------------------------------------------
-
-df_cv.to_csv(
-    "paper_outputs_xy_optuna/RF_reducido_RK_cv_metrics.csv",
-    index=False
-)
-
-# ------------------------------------------------------------
-# Predicciones OOF
-# ------------------------------------------------------------
-
-df_oof = pd.DataFrame({
-    "y_true": y,
-    "pred_RF": pred_oof_rf,
-    "pred_RF_RK": pred_oof_rk,
-    "resid_RF_RK": resid_oof_rk,
-    "Xcoord": coords[:, 0],
-    "Ycoord": coords[:, 1]
+final_table_4 = pd.DataFrame(index=model_order_4, columns=list(metrics_info_4))
+for model_name in model_order_4:
+    for metric in metrics_info_4:
+        final_table_4.loc[model_name, metric] = format_mean_std_letter_4(model_name, metric)
+final_table_4.index = [model_labels_4[m] for m in final_table_4.index]
+final_table_4.index.name = "Model"
+final_table_4 = final_table_4.rename(columns={
+    "R2": "R²", "nRMSE_%": "nRMSE (%)", "RelError_%": "MAPE (%)"
 })
+final_table_4.to_csv(os.path.join(out_folder, "Table4_nested_outer_test_meanstd_letters.csv"))
+df_folds_4models.to_csv(
+    os.path.join(out_folder, "nested_outer_test_metrics_4models_by_fold.csv"), index=False
+)
+print("\n=== TABLE 4: held-out OUTER test folds only ===")
+display(final_table_4)
 
+# ------------------------------------------------------------
+# Final full-data tuning for the deployable reduced map model ONLY.
+# This tuning is NOT used to estimate Table 4 performance.
+# ------------------------------------------------------------
+print("\n🚀 Final reduced RF+RK tuning on complete dataset (deployment only)")
+best_params_rf, best_final_inner_rmse, study = optimize_reduced_rf_rk_inner(
+    X, y, coords, seed=random_seed + 2000, n_trials=optuna_trials_rf,
+    timeout=timeout_seconds
+)
+print("Final full-data CV RMSE (deployment tuning only):", best_final_inner_rmse)
+print("Final params:", best_params_rf)
+
+# OOF predictions below are the unbiased OUTER-test predictions from nested CV.
+df_oof = pd.DataFrame({
+    "y_true": y, "pred_RF": pred_oof_rf, "pred_RF_RK": pred_oof_rk,
+    "resid_RF_RK": resid_oof_rk, "Xcoord": coords[:, 0], "Ycoord": coords[:, 1]
+})
 df_oof.to_csv(
-    "paper_outputs_xy_optuna/RF_reducido_RK_oof_predictions.csv",
-    index=False
+    "paper_outputs_xy_optuna/RF_reducido_RK_nested_outer_oof_predictions.csv", index=False
 )
 ```
 
